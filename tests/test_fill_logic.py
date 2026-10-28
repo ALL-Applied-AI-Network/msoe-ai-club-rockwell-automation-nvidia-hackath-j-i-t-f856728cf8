@@ -53,6 +53,19 @@ class FillLogicTests(unittest.TestCase):
             self.assertTrue(required.issubset(occupied_labels))
             self.assertIsNone(scene.missed_position)
 
+    def test_zero_damage_weight_disables_damaged_vials(self) -> None:
+        rng = random.Random(91)
+        for class_balance in (False, True):
+            for _ in range(500):
+                scene = sample_fill_scene(
+                    rng, class_balance=class_balance, damage_weight=0.0
+                )
+                self.assertNotIn("damaged_vial", scene.labels.values())
+
+    def test_negative_damage_weight_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            sample_fill_scene(random.Random(1), damage_weight=-0.1)
+
     def test_distribution_has_endpoints_and_favors_later_stages(self) -> None:
         rng = random.Random(2026)
         counts = Counter()

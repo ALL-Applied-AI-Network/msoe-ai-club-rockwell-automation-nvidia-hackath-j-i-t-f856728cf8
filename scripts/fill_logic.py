@@ -35,12 +35,18 @@ def fill_count_weights() -> tuple[float, ...]:
 
 
 def sample_fill_scene(
-    rng: random.Random, *, class_balance: bool = False
+    rng: random.Random,
+    *,
+    class_balance: bool = False,
+    damage_weight: float = 1.0,
 ) -> FillScene:
     """Sample one fill-prefix scene without importing Isaac Sim."""
+    if damage_weight < 0.0:
+        raise ValueError("damage_weight must be non-negative")
     expected_through = rng.choices(range(31), weights=fill_count_weights(), k=1)[0]
     if class_balance:
-        expected_through = max(3, expected_through)
+        required_defects = 3 if damage_weight > 0.0 else 2
+        expected_through = max(required_defects, expected_through)
 
     missed_position = None
     if not class_balance and expected_through >= 2 and rng.random() < 0.03:
@@ -53,13 +59,18 @@ def sample_fill_scene(
         if index > expected_through or slot == missed_position:
             labels[slot] = "no_vial"
         else:
+            occupied_weights = (*OCCUPIED_WEIGHTS[:3], OCCUPIED_WEIGHTS[3] * damage_weight)
             labels[slot] = rng.choices(
-                OCCUPIED_CLASSES, weights=OCCUPIED_WEIGHTS, k=1
+                OCCUPIED_CLASSES, weights=occupied_weights, k=1
             )[0]
 
     if class_balance:
-        forced_slots = rng.sample(list(SLOT_NAMES[:expected_through]), 3)
-        forced_classes = ["damaged_vial", "crooked_cap", "missing_cap"]
+        forced_classes = ["crooked_cap", "missing_cap"]
+        if damage_weight > 0.0:
+            forced_classes.append("damaged_vial")
+        forced_slots = rng.sample(
+            list(SLOT_NAMES[:expected_through]), len(forced_classes)
+        )
         rng.shuffle(forced_classes)
         for slot, label in zip(forced_slots, forced_classes, strict=True):
             labels[slot] = label

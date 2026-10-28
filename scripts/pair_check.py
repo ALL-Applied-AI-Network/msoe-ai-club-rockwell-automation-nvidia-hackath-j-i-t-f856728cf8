@@ -1,4 +1,4 @@
-"""Compare defect crops numerically with the median generated pass crop."""
+"""Compare each crop with its closest of five randomly selected pass crops."""
 
 from __future__ import annotations
 
@@ -12,14 +12,24 @@ import cv2
 import numpy as np
 
 
-TARGET_CLASSES = ("damaged_vial", "crooked_cap")
+CLASSES = ("pass", "missing_cap", "crooked_cap", "damaged_vial", "no_vial")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path, help="Generator output folder")
-    parser.add_argument("--pass-samples", type=int, default=5)
+    parser.add_argument(
+        "--pass-samples",
+        type=int,
+        default=5,
+        help="Number of random pass references considered per crop.",
+    )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--labels",
+        type=Path,
+        help="Labels document; defaults to the sole *labels.json in out.",
+    )
     return parser.parse_args()
 
 
@@ -30,59 +40,77 @@ def load_crop(path: Path) -> np.ndarray:
     return image.astype(np.float32)
 
 
+def resolve_labels(out: Path, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    candidates = sorted(out.glob("*labels.json"))
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Expected one *labels.json in {out}, found {len(candidates)}; "
+            "pass --labels explicitly"
+        )
+    return candidates[0]
+
+
 def main() -> None:
     args = parse_args()
-    document = json.loads((args.out / "labels.json").read_text(encoding="utf-8"))
+    if args.pass_samples < 1:
+        raise ValueError("--pass-samples must be at least 1")
+    labels_path = resolve_labels(args.out, args.labels)
+    document = json.loads(labels_path.read_text(encoding="utf-8"))
     by_class: dict[str, list[tuple[str, Path, dict, str]]] = {
-        "pass": [],
-        **{label: [] for label in TARGET_CLASSES},
+        label: [] for label in CLASSES
     }
     class_counts: Counter[str] = Counter()
     for record in document["images"]:
         image_stem = Path(record["image"]).stem
         for slot, label in record["labels"].items():
             class_counts[label] += 1
-            if label not in by_class:
-                continue
             crop_path = args.out / "crops" / f"{image_stem}_{slot}.png"
             by_class[label].append((crop_path.name, crop_path, record, slot))
 
-    if not by_class["pass"]:
-        raise RuntimeError("No pass crops are available for the median reference")
-    pass_images = [load_crop(path) for _, path, _, _ in by_class["pass"]]
-    shapes = {image.shape for image in pass_images}
-    if len(shapes) != 1:
-        raise ValueError("Pass crops do not all have the same dimensions")
-    median_pass = np.median(np.stack(pass_images, axis=0), axis=0)
+    if len(by_class["pass"]) < 2:
+        raise RuntimeError("At least two pass crops are required")
+    loaded: dict[Path, np.ndarray] = {}
+
+    def image_for(path: Path) -> np.ndarray:
+        if path not in loaded:
+            loaded[path] = load_crop(path)
+        return loaded[path]
+
+    pass_shape = image_for(by_class["pass"][0][1]).shape
+    rng = random.Random(args.seed)
+
+    def closest_pass_difference(path: Path) -> float:
+        eligible = [item for item in by_class["pass"] if item[1] != path]
+        references = rng.sample(
+            eligible, min(args.pass_samples, len(eligible))
+        )
+        crop = image_for(path)
+        if crop.shape != pass_shape:
+            raise ValueError(f"Unexpected crop shape: {path}")
+        return min(
+            float(np.mean(np.abs(crop - image_for(reference_path))))
+            for _, reference_path, _, _ in references
+        )
 
     print(
         f"image size: {document['image_size'][0]} x {document['image_size'][1]} px"
     )
-    print(f"crop size: {pass_images[0].shape[1]} x {pass_images[0].shape[0]} px")
+    print(f"crop size: {pass_shape[1]} x {pass_shape[0]} px")
     print("label counts:")
-    for label in ("pass", "missing_cap", "crooked_cap", "damaged_vial", "no_vial"):
+    for label in CLASSES:
         print(f"  {label}: {class_counts[label]}")
-    print(f"pass reference crops: {len(pass_images)}")
+    print(
+        f"metric: per-crop minimum mean absolute difference to "
+        f"{args.pass_samples} random pass crops"
+    )
 
-    rng = random.Random(args.seed)
-    sample_count = min(args.pass_samples, len(by_class["pass"]))
-    sampled_passes = rng.sample(by_class["pass"], sample_count)
-    pass_differences = []
-    print("\nrandom pass baseline")
-    for filename, path, _, _ in sampled_passes:
-        difference = float(np.mean(np.abs(load_crop(path) - median_pass)))
-        pass_differences.append(difference)
-        print(f"{filename}: {difference:.3f}")
-    print(f"random pass mean: {np.mean(pass_differences):.3f}")
-
-    for label in TARGET_CLASSES:
+    for label in CLASSES:
         differences = []
         print(f"\n{label}")
         for filename, path, record, slot in by_class[label]:
-            crop = load_crop(path)
-            if crop.shape != median_pass.shape:
-                raise ValueError(f"Unexpected crop shape: {path}")
-            difference = float(np.mean(np.abs(crop - median_pass)))
+            difference = closest_pass_difference(path)
             differences.append(difference)
             if label == "damaged_vial":
                 damage = record["variations"][slot].get("damage", {})
@@ -91,12 +119,10 @@ def main() -> None:
                     f"type={damage.get('kind', 'unknown')}  "
                     f"strength={damage.get('strength', 'unknown')}"
                 )
-            else:
-                print(f"{filename}: {difference:.3f}")
         if differences:
-            print(f"{label} mean: {np.mean(differences):.3f}")
+            print(f"{label} mean minimum difference: {np.mean(differences):.3f}")
         else:
-            print(f"{label} mean: no samples")
+            print(f"{label} mean minimum difference: no samples")
 
 
 if __name__ == "__main__":
