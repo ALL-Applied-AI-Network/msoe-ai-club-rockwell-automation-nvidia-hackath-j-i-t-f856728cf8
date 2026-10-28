@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(r"C:\Users\aamp7\Downloads\fit_check"),
     )
+    parser.add_argument("--suffix", default="", help="Suffix added before .png")
     return parser.parse_args()
 
 
@@ -56,6 +57,9 @@ def slot_point(boxes: dict, slot: str, zmode: str) -> np.ndarray:
         z_value = tube[0, 2]
     elif zmode == "tube_max":
         z_value = tube[1, 2]
+    elif zmode == "cap_min":
+        cap = np.asarray(boxes[f"/TrayInspection/{slot}_cap"], dtype=np.float64)
+        z_value = cap[0, 2]
     elif zmode == "cap_center":
         cap = np.asarray(boxes[f"/TrayInspection/{slot}_cap"], dtype=np.float64)
         z_value = cap[:, 2].mean()
@@ -139,8 +143,8 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     stem = args.image.stem
-    undistorted_path = args.out / f"{stem}_undistorted.png"
-    overlay_path = args.out / f"{stem}_fit2.png"
+    undistorted_path = args.out / f"{stem}_undistorted{args.suffix}.png"
+    overlay_path = args.out / f"{stem}_fit2{args.suffix}.png"
     if not cv2.imwrite(str(undistorted_path), undistorted):
         raise OSError(f"Could not write image: {undistorted_path}")
     if not cv2.imwrite(str(overlay_path), overlay):

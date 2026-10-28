@@ -20,6 +20,7 @@ from fill_logic import SLOT_NAMES, sample_fill_scene
 from fisheye import (
     PRINCIPAL_POINT,
     invert_theta,
+    jitter_camera_pose,
     project_world,
 )
 
@@ -27,7 +28,7 @@ from fisheye import (
 CAMERA_PATH = Path("/job/in/cameras/camera_fit.json")
 STAGE_PATH = "/job/in/stations/tray_inspection/tray_inspection.usdc"
 CROP_OFFSETS = (-38, -47, 42, 43)
-CROP_SHIFT = (8, -12)
+CROP_SHIFT = (0, 0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,20 +192,23 @@ def main() -> None:
 
         # USD cameras look down -Z with +Y up, while the fitted CV camera uses
         # +Z forward and +Y down.
-        x_axis = rotation_world_to_cv[0]
-        y_axis = -rotation_world_to_cv[1]
-        z_axis = -rotation_world_to_cv[2]
-        camera_matrix = Gf.Matrix4d(
-            *[
-                float(value)
-                for row in (x_axis, y_axis, z_axis)
-                for value in (*row, 0.0)
-            ],
-            float(camera_position[0]),
-            float(camera_position[1]),
-            float(camera_position[2]),
-            1.0,
-        )
+        def usd_camera_matrix(cv_rotation, cv_position):
+            x_axis = cv_rotation[0]
+            y_axis = -cv_rotation[1]
+            z_axis = -cv_rotation[2]
+            return Gf.Matrix4d(
+                *[
+                    float(value)
+                    for row in (x_axis, y_axis, z_axis)
+                    for value in (*row, 0.0)
+                ],
+                float(cv_position[0]),
+                float(cv_position[1]),
+                float(cv_position[2]),
+                1.0,
+            )
+
+        camera_matrix = usd_camera_matrix(rotation_world_to_cv, camera_position)
         camera_prim = UsdGeom.Camera.Define(stage, "/GenCamV2")
         camera_prim.GetHorizontalApertureAttr().Set(36.0)
         camera_prim.GetVerticalApertureAttr().Set(
@@ -212,7 +216,8 @@ def main() -> None:
         )
         camera_prim.GetFocalLengthAttr().Set(render_focal / render_width * 36.0)
         camera_prim.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 20.0))
-        UsdGeom.Xformable(camera_prim).AddTransformOp().Set(camera_matrix)
+        camera_transform_op = UsdGeom.Xformable(camera_prim).AddTransformOp()
+        camera_transform_op.Set(camera_matrix)
 
         render_product = rep.create.render_product(
             "/GenCamV2", (render_width, render_height)
@@ -325,22 +330,44 @@ def main() -> None:
             backend_counts[backend] = backend_counts.get(backend, 0) + 1
         print(f"deformation backends: {backend_counts}", flush=True)
 
-        def project(world_point):
+        def project(world_point, cv_rotation, cv_position):
             return project_world(
                 np.asarray([world_point], dtype=np.float64),
-                rotation_world_to_cv,
-                camera_position,
+                cv_rotation,
+                cv_position,
                 focal,
                 k1,
                 k2,
             )[0].tolist()
 
-        projected_centers = {}
+        fit_zmode = str(camera["zmode"])
+        label_world_points = {}
         for name, record in slot_info.items():
             cap = record["cap"]
-            projected_centers[name] = project(
-                (cap["minimum"] + cap["maximum"]) / 2.0
+            tube = record["tube"]
+            cap_center = (cap["minimum"] + cap["maximum"]) / 2.0
+            if fit_zmode == "cap_min":
+                z_value = float(cap["minimum"][2])
+            elif fit_zmode == "tube_max":
+                z_value = float(tube["maximum"][2])
+            elif fit_zmode == "cap_center":
+                z_value = float(cap_center[2])
+            elif fit_zmode == "tube_min":
+                z_value = float(tube["minimum"][2])
+            else:
+                raise ValueError(f"Unsupported camera zmode: {fit_zmode}")
+            label_world_points[name] = np.array(
+                [cap_center[0], cap_center[1], z_value], dtype=np.float64
             )
+        nominal_projected_centers = {
+            name: project(point, rotation_world_to_cv, camera_position)
+            for name, point in label_world_points.items()
+        }
+        label_world_array = np.vstack(list(label_world_points.values()))
+        nominal_camera_points = (
+            rotation_world_to_cv @ (label_world_array - camera_position).T
+        ).T
+        reference_depth = float(nominal_camera_points[:, 2].mean())
 
         def restore_meshes(tube):
             for mesh_record in tube["meshes"]:
@@ -599,12 +626,20 @@ def main() -> None:
 
         def randomize_light(light_record, intensity_range, scene_rng):
             factor = scene_rng.uniform(*intensity_range)
-            kelvin = scene_rng.uniform(2800.0, 7600.0)
+            kelvin = scene_rng.uniform(3500.0, 6500.0)
+            color = [
+                1.0,
+                scene_rng.uniform(0.9, 1.0),
+                scene_rng.uniform(0.8, 1.0),
+            ]
             jitter = [scene_rng.uniform(-0.045, 0.045) for _ in range(3)]
             prim = light_record["prim"]
             prim.GetAttribute("inputs:intensity").Set(
                 light_record["base_intensity"] * factor
             )
+            color_attribute = prim.GetAttribute("inputs:color")
+            if color_attribute.IsValid():
+                color_attribute.Set(Gf.Vec3f(*color))
             light_api = UsdLux.LightAPI(prim)
             light_api.CreateEnableColorTemperatureAttr(True).Set(True)
             light_api.CreateColorTemperatureAttr(kelvin).Set(kelvin)
@@ -616,6 +651,7 @@ def main() -> None:
             return {
                 "intensity_factor": factor,
                 "color_temperature_k": kelvin,
+                "color_rgb": color,
                 "position_jitter_m": jitter,
             }
 
@@ -652,6 +688,41 @@ def main() -> None:
             image_seed = master_rng.randrange(0, 2**63)
             scene_rng = random.Random(image_seed)
             fill_scene = sample_fill_scene(scene_rng)
+            requested_shift_px = [
+                scene_rng.uniform(-20.0, 20.0),
+                scene_rng.uniform(-20.0, 20.0),
+            ]
+            rotation_jitter_deg = [
+                scene_rng.uniform(-0.5, 0.5),
+                scene_rng.uniform(-0.5, 0.5),
+                scene_rng.uniform(-0.5, 0.5),
+            ]
+            (
+                jittered_rotation,
+                jittered_position,
+                translation_world,
+            ) = jitter_camera_pose(
+                rotation_world_to_cv,
+                camera_position,
+                focal,
+                reference_depth,
+                requested_shift_px,
+                rotation_jitter_deg,
+            )
+            camera_transform_op.Set(
+                usd_camera_matrix(jittered_rotation, jittered_position)
+            )
+            projected_centers = {
+                name: project(point, jittered_rotation, jittered_position)
+                for name, point in label_world_points.items()
+            }
+            camera_jitter = {
+                "requested_shift_px": requested_shift_px,
+                "translation_world_m": translation_world.tolist(),
+                "rotation_xyz_deg": rotation_jitter_deg,
+                "position_m": jittered_position.tolist(),
+                "R_world_to_cv": jittered_rotation.tolist(),
+            }
             variations = {}
             for slot_name in SLOT_NAMES:
                 variations[slot_name] = apply_slot(
@@ -702,6 +773,7 @@ def main() -> None:
                     "missed_position": fill_scene.missed_position,
                     "lights": lights,
                     "seed": image_seed,
+                    "camera_jitter": camera_jitter,
                     "projected_centers": projected_centers,
                     "variations": variations,
                 }
@@ -721,7 +793,7 @@ def main() -> None:
                 },
                 "crop_offsets": list(CROP_OFFSETS),
                 "crop_shift": list(CROP_SHIFT),
-                "positions": projected_centers,
+                "positions": nominal_projected_centers,
                 "deformation_backends": {
                     name: slot_info[name]["tube"]["deformation_backend"]
                     for name in SLOT_NAMES

@@ -1,0 +1,14 @@
+zmode       rms_px  loo_rms  theta_max  min_deriv       k1       k2  bound  plausible  grid_w  grid_h  cam_h_m
+cap_min       6.425   23.890   0.833309   0.649463  -0.1075  -0.0525    no         yes  324.83  312.36   1.2296
+tube_max      4.816   16.170   1.231172   1.000000   0.3661   0.3247    no         yes  325.75  309.85   0.4083
+cap_center    5.557   20.352   0.744449   0.790975  -0.0492  -0.0828    no         yes  325.20  311.56   1.3295
+tube_min      4.340   12.663   1.113027   1.000000   0.0601   0.5000    yes        yes  325.84  309.75   0.5202
+
+selected: tube_max (bound_hitting=False, plausible=True, loo_rms_px=16.170)
+view_122 translation-aligned validation (no refit)
+removed translation: (2.771, 19.803) px
+scale ratio x: 1.000781
+scale ratio y: 0.988349
+mean residual: 3.211 px
+RMS residual: 3.725 px
+max residual: 5.598 px

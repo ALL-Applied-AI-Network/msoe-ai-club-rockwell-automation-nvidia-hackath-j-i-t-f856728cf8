@@ -52,6 +52,8 @@ def main() -> None:
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(f"Could not read image: {image_path}")
+        if "camera_jitter" in record and "projected_centers" not in record:
+            raise ValueError("Jittered image record is missing projected_centers")
         positions = record.get("projected_centers", default_positions)
         for slot, center_values in positions.items():
             center = (int(round(center_values[0])), int(round(center_values[1])))
@@ -80,6 +82,24 @@ def main() -> None:
                 shifted_y + int(crop_offsets[3]),
             )
             cv2.rectangle(image, top_left, bottom_right, color, 1, cv2.LINE_AA)
+
+        jitter = record.get("camera_jitter")
+        if jitter:
+            shift = jitter["requested_shift_px"]
+            rotation = jitter["rotation_xyz_deg"]
+            cv2.putText(
+                image,
+                (
+                    f"camera shift=({shift[0]:+.1f},{shift[1]:+.1f}) px "
+                    f"rot=({rotation[0]:+.2f},{rotation[1]:+.2f},{rotation[2]:+.2f}) deg"
+                ),
+                (18, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
         output_path = args.out / f"{stem}_overlay.png"
         if not cv2.imwrite(str(output_path), image):

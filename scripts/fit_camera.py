@@ -32,8 +32,11 @@ from fisheye import (
 
 IMAGE_SIZE = (1920, 1080)
 FOCAL_STARTS = (700.0, 900.0, 1100.0, 1400.0)
-ZMODES = ("tube_min", "tube_max", "cap_center")
+ZMODES = ("cap_min", "tube_max", "cap_center", "tube_min")
 MIN_DERIVATIVE = 0.05
+DISTORTION_BOUND = 0.5
+BOUND_MARGIN = 0.01 * (2.0 * DISTORTION_BOUND)
+GRID_CORNERS = ("G26", "G01", "G30", "G05")
 ANCHOR_PIXELS = {
     "G01": (1078.0, 406.0),
     "G05": (1067.0, 715.0),
@@ -41,6 +44,12 @@ ANCHOR_PIXELS = {
     "G30": (744.0, 710.0),
     "S01": (1480.0, 630.0),
     "S05": (1466.0, 921.0),
+}
+VIEW_122_PIXELS = {
+    "G26": (748.0, 377.0),
+    "G01": (1075.0, 387.0),
+    "G30": (741.0, 694.0),
+    "G05": (1065.0, 697.0),
 }
 
 
@@ -53,6 +62,13 @@ class FitResult:
     loo_rms_px: float
     theta_max: float
     min_dtheta_d: float
+    grid_width_px: float
+    grid_height_px: float
+    camera_height_m: float
+    k1: float
+    k2: float
+    bound_hitting: bool
+    plausible: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,9 +81,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional fisheye camera JSON used as the pose initialization.",
     )
-    parser.add_argument("--zmode", choices=ZMODES, default="tube_min")
+    parser.add_argument("--zmode", choices=("auto",) + ZMODES, default="auto")
     parser.add_argument(
         "--fit-json", type=Path, default=Path("calib/camera_fit.json")
+    )
+    parser.add_argument(
+        "--fit-table", type=Path, default=Path("calib/fit_table.txt")
     )
     return parser.parse_args()
 
@@ -100,6 +119,10 @@ def slot_point(boxes: Mapping[str, np.ndarray], slot: str, zmode: str) -> np.nda
         z_value = tube[0, 2]
     elif zmode == "tube_max":
         z_value = tube[1, 2]
+    elif zmode == "cap_min":
+        cap_suffix = f"/{slot}_cap"
+        caps = [box for path, box in boxes.items() if path.endswith(cap_suffix)]
+        z_value = caps[0][0, 2] if len(caps) == 1 else tube[1, 2]
     elif zmode == "cap_center":
         cap_suffix = f"/{slot}_cap"
         caps = [box for path, box in boxes.items() if path.endswith(cap_suffix)]
@@ -204,12 +227,12 @@ def parameter_bounds(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     lower = np.array(
         [-2.0 * math.pi] * 3
         + [point_min[0] - 3.0, point_min[1] - 3.0, point_max[2] + 0.05]
-        + [500.0, -1.0, -1.0]
+        + [500.0, -DISTORTION_BOUND, -DISTORTION_BOUND]
     )
     upper = np.array(
         [2.0 * math.pi] * 3
         + [point_max[0] + 3.0, point_max[1] + 3.0, point_max[2] + 5.0]
-        + [2500.0, 1.0, 1.0]
+        + [2500.0, DISTORTION_BOUND, DISTORTION_BOUND]
     )
     return lower, upper
 
@@ -258,6 +281,24 @@ def fit_multistart(
     return best[1]
 
 
+def grid_size(projected: Mapping[str, np.ndarray]) -> tuple[float, float]:
+    width = (
+        abs(float(projected["G01"][0] - projected["G26"][0]))
+        + abs(float(projected["G05"][0] - projected["G30"][0]))
+    ) / 2.0
+    height = (
+        abs(float(projected["G30"][1] - projected["G26"][1]))
+        + abs(float(projected["G05"][1] - projected["G01"][1]))
+    ) / 2.0
+    return width, height
+
+
+def coefficient_hits_bound(value: float) -> bool:
+    return min(
+        abs(value + DISTORTION_BOUND), abs(value - DISTORTION_BOUND)
+    ) <= BOUND_MARGIN
+
+
 def evaluate_mode(
     boxes: Mapping[str, np.ndarray], zmode: str, init_path: Path | None
 ) -> tuple[list[str], FitResult]:
@@ -295,6 +336,23 @@ def evaluate_mode(
     theta_max, min_derivative_value = fitted_geometry(
         float(params[6]), float(params[7]), float(params[8])
     )
+    corner_world = np.vstack(
+        [slot_point(boxes, slot, zmode) for slot in GRID_CORNERS]
+    )
+    corner_pixels = project(corner_world, params)
+    projected_corners = {
+        slot: pixel
+        for slot, pixel in zip(GRID_CORNERS, corner_pixels, strict=True)
+    }
+    grid_width, grid_height = grid_size(projected_corners)
+    _, position, _, k1, k2 = unpack(params)
+    camera_height = float(position[2] - world[:, 2].mean())
+    bound_hitting = coefficient_hits_bound(k1) or coefficient_hits_bound(k2)
+    plausible = (
+        0.2 <= camera_height <= 3.0
+        and theta_max < math.radians(80.0)
+        and min_derivative_value > MIN_DERIVATIVE
+    )
     return names, FitResult(
         params=params,
         rms_px=rms,
@@ -303,6 +361,13 @@ def evaluate_mode(
         loo_rms_px=loo_rms,
         theta_max=theta_max,
         min_dtheta_d=min_derivative_value,
+        grid_width_px=grid_width,
+        grid_height_px=grid_height,
+        camera_height_m=camera_height,
+        k1=k1,
+        k2=k2,
+        bound_hitting=bound_hitting,
+        plausible=plausible,
     )
 
 
@@ -317,6 +382,12 @@ def print_mode_details(names: Sequence[str], zmode: str, fit: FitResult) -> None
     print(f"Leave-one-out RMS: {fit.loo_rms_px:.3f} px")
     print(f"theta_max: {fit.theta_max:.6f} rad")
     print(f"minimum d(theta_d)/d(theta): {fit.min_dtheta_d:.6f}")
+    print(f"k1: {fit.k1:.6f}; k2: {fit.k2:.6f}")
+    print(f"k1/k2 within 1% of a bound: {'yes' if fit.bound_hitting else 'no'}")
+    print(
+        f"grid: {fit.grid_width_px:.2f} x {fit.grid_height_px:.2f} px; "
+        f"camera height above anchor plane: {fit.camera_height_m:.4f} m"
+    )
 
 
 def save_fit(path: Path, zmode: str, fit: FitResult) -> None:
@@ -339,6 +410,56 @@ def save_fit(path: Path, zmode: str, fit: FitResult) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def comparison_table(evaluated: Mapping[str, FitResult]) -> str:
+    lines = [
+        "zmode       rms_px  loo_rms  theta_max  min_deriv       k1       k2  bound  plausible  grid_w  grid_h  cam_h_m"
+    ]
+    for zmode in ZMODES:
+        fit = evaluated[zmode]
+        lines.append(
+            f"{zmode:<10}  {fit.rms_px:7.3f}  {fit.loo_rms_px:7.3f}  "
+            f"{fit.theta_max:9.6f}  {fit.min_dtheta_d:9.6f}  "
+            f"{fit.k1:7.4f}  {fit.k2:7.4f}  "
+            f"{'yes' if fit.bound_hitting else 'no ':>5}  "
+            f"{'yes' if fit.plausible else 'no ':>9}  "
+            f"{fit.grid_width_px:6.2f}  {fit.grid_height_px:6.2f}  "
+            f"{fit.camera_height_m:7.4f}"
+        )
+    return "\n".join(lines)
+
+
+def validate_view_122(
+    boxes: Mapping[str, np.ndarray], zmode: str, fit: FitResult
+) -> str:
+    world = np.vstack([slot_point(boxes, slot, zmode) for slot in GRID_CORNERS])
+    projected_array = project(world, fit.params)
+    projected = {
+        slot: pixel
+        for slot, pixel in zip(GRID_CORNERS, projected_array, strict=True)
+    }
+    real = {
+        slot: np.asarray(VIEW_122_PIXELS[slot], dtype=np.float64)
+        for slot in GRID_CORNERS
+    }
+    offsets = np.vstack([projected[slot] - real[slot] for slot in GRID_CORNERS])
+    translation = offsets.mean(axis=0)
+    residual_vectors = offsets - translation
+    residuals_px = np.linalg.norm(residual_vectors, axis=1)
+    projected_width, projected_height = grid_size(projected)
+    real_width, real_height = grid_size(real)
+    return "\n".join(
+        [
+            "view_122 translation-aligned validation (no refit)",
+            f"removed translation: ({translation[0]:.3f}, {translation[1]:.3f}) px",
+            f"scale ratio x: {projected_width / real_width:.6f}",
+            f"scale ratio y: {projected_height / real_height:.6f}",
+            f"mean residual: {residuals_px.mean():.3f} px",
+            f"RMS residual: {np.sqrt(np.mean(residuals_px * residuals_px)):.3f} px",
+            f"max residual: {residuals_px.max():.3f} px",
+        ]
+    )
+
+
 def main() -> None:
     args = parse_args()
     boxes = load_boxes(args.prims)
@@ -348,18 +469,38 @@ def main() -> None:
         evaluated[zmode] = fit
         print_mode_details(names, zmode, fit)
 
+    table = comparison_table(evaluated)
     print("\nZ-mode comparison")
-    print("zmode       rms_px  loo_rms_px  theta_max  min_derivative")
-    for zmode in ZMODES:
-        fit = evaluated[zmode]
-        print(
-            f"{zmode:<10}  {fit.rms_px:7.3f}  {fit.loo_rms_px:10.3f}  "
-            f"{fit.theta_max:9.6f}  {fit.min_dtheta_d:14.6f}"
-        )
+    print(table)
 
-    selected = evaluated[args.zmode]
-    save_fit(args.fit_json, args.zmode, selected)
-    print(f"\nSaved {args.zmode} fit to {args.fit_json}")
+    if args.zmode == "auto":
+        winner_mode = min(
+            ZMODES,
+            key=lambda mode: (
+                evaluated[mode].bound_hitting,
+                not evaluated[mode].plausible,
+                evaluated[mode].loo_rms_px,
+                evaluated[mode].rms_px,
+            ),
+        )
+    else:
+        winner_mode = args.zmode
+    winner = evaluated[winner_mode]
+    selection = (
+        f"selected: {winner_mode} (bound_hitting={winner.bound_hitting}, "
+        f"plausible={winner.plausible}, loo_rms_px={winner.loo_rms_px:.3f})"
+    )
+    validation = validate_view_122(boxes, winner_mode, winner)
+    print("\n" + selection)
+    print(validation)
+    save_fit(args.fit_json, winner_mode, winner)
+    args.fit_table.parent.mkdir(parents=True, exist_ok=True)
+    args.fit_table.write_text(
+        table + "\n\n" + selection + "\n" + validation + "\n",
+        encoding="utf-8",
+    )
+    print(f"Saved winner to {args.fit_json}")
+    print(f"Saved table to {args.fit_table}")
 
 
 if __name__ == "__main__":

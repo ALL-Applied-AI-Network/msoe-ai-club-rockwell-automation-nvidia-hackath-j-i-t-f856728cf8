@@ -150,3 +150,53 @@ def project_world(
     return pinhole_normalized_to_fisheye_pixels(
         normalized, focal_px, k1, k2, principal_point=principal_point
     )
+
+
+def jitter_camera_pose(
+    rotation_world_to_cv: np.ndarray,
+    position_m: np.ndarray,
+    focal_px: float,
+    reference_depth_m: float,
+    shift_px: tuple[float, float] | list[float] | np.ndarray,
+    rotation_deg: tuple[float, float, float] | list[float] | np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply camera-frame translation and XYZ rotation jitter to a CV pose."""
+    base_rotation = np.asarray(rotation_world_to_cv, dtype=np.float64)
+    base_position = np.asarray(position_m, dtype=np.float64)
+    shift = np.asarray(shift_px, dtype=np.float64)
+    angles = np.radians(np.asarray(rotation_deg, dtype=np.float64))
+    translation_camera = np.array(
+        [
+            -shift[0] * reference_depth_m / focal_px,
+            -shift[1] * reference_depth_m / focal_px,
+            0.0,
+        ],
+        dtype=np.float64,
+    )
+    translation_world = base_rotation.T @ translation_camera
+    jittered_position = base_position + translation_world
+
+    x_angle, y_angle, z_angle = angles
+    rotate_x = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(x_angle), -math.sin(x_angle)],
+            [0.0, math.sin(x_angle), math.cos(x_angle)],
+        ]
+    )
+    rotate_y = np.array(
+        [
+            [math.cos(y_angle), 0.0, math.sin(y_angle)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(y_angle), 0.0, math.cos(y_angle)],
+        ]
+    )
+    rotate_z = np.array(
+        [
+            [math.cos(z_angle), -math.sin(z_angle), 0.0],
+            [math.sin(z_angle), math.cos(z_angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    jitter_rotation = rotate_z @ rotate_y @ rotate_x
+    return jitter_rotation @ base_rotation, jittered_position, translation_world
