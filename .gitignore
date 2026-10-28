@@ -24,6 +24,7 @@ renders/
 
 # Secrets
 .env
+*.env
 *.key
 *.pem
 *token*

@@ -13,10 +13,32 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from fill_logic import OCCUPIED_CLASSES, SLOT_NAMES, sample_fill_scene
+from fill_logic import (
+    ALL_SLOT_NAMES,
+    G_SLOT_NAMES,
+    OCCUPIED_CLASSES,
+    SLOT_NAMES,
+    S_SLOT_NAMES,
+    sample_fill_scene,
+)
 
 
 class FillLogicTests(unittest.TestCase):
+    def test_fixture_slot_names_are_complete_and_disjoint(self) -> None:
+        self.assertEqual(len(G_SLOT_NAMES), 30)
+        self.assertEqual(len(S_SLOT_NAMES), 30)
+        self.assertEqual(len(ALL_SLOT_NAMES), 60)
+        self.assertEqual(len(set(ALL_SLOT_NAMES)), 60)
+        self.assertEqual(G_SLOT_NAMES[0], "G01")
+        self.assertEqual(G_SLOT_NAMES[-1], "G30")
+        self.assertEqual(S_SLOT_NAMES[0], "S01")
+        self.assertEqual(S_SLOT_NAMES[-1], "S30")
+
+    def test_s_fixture_sampling_uses_s_names(self) -> None:
+        scene = sample_fill_scene(random.Random(29), prefix="S")
+        self.assertEqual(tuple(scene.labels), S_SLOT_NAMES)
+        self.assertTrue(all(name.startswith("S") for name in scene.labels))
+
     def test_prefix_and_not_yet_filled_semantics(self) -> None:
         rng = random.Random(41)
         for _ in range(2_000):

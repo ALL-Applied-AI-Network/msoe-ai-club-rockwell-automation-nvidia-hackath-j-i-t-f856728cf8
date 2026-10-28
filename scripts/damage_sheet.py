@@ -116,7 +116,8 @@ def main() -> None:
             for crop_path, strength in selected
         ]
         if tiles:
-            tile_height, tile_width = tiles[0].shape[:2]
+            tile_height = max(tile.shape[0] for tile in tiles)
+            tile_width = max(tile.shape[1] for tile in tiles)
         else:
             tile_height, tile_width = 90 * TILE_SCALE + CAPTION_HEIGHT, 80 * TILE_SCALE
         sheet = np.full(
@@ -126,9 +127,10 @@ def main() -> None:
         )
         for index, tile in enumerate(tiles):
             row, column = divmod(index, GRID_COLUMNS)
-            y0 = row * tile_height
-            x0 = column * tile_width
-            sheet[y0 : y0 + tile_height, x0 : x0 + tile_width] = tile
+            height, width = tile.shape[:2]
+            y0 = row * tile_height + (tile_height - height) // 2
+            x0 = column * tile_width + (tile_width - width) // 2
+            sheet[y0 : y0 + height, x0 : x0 + width] = tile
         output_path = args.out / f"{damage_type}.png"
         if not cv2.imwrite(str(output_path), sheet):
             raise OSError(f"Could not write damage sheet: {output_path}")
