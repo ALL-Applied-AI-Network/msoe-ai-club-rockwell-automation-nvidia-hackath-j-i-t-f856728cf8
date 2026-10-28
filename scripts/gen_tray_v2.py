@@ -17,9 +17,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from fill_logic import SLOT_NAMES, sample_fill_scene
+from fill_logic import ALL_SLOT_NAMES, G_SLOT_NAMES, S_SLOT_NAMES, sample_fill_scene
 from fisheye import (
     PRINCIPAL_POINT,
+    fisheye_pixels_to_pinhole_normalized,
     invert_theta,
     jitter_camera_pose,
     project_world,
@@ -27,9 +28,13 @@ from fisheye import (
 
 
 CAMERA_PATH = Path("/job/in/cameras/camera_fit.json")
+LABELER_CALIBRATION_PATH = Path("/job/in/tools/calibration.json")
 STAGE_PATH = "/job/in/stations/tray_inspection/tray_inspection.usdc"
-CROP_OFFSETS = (-38, -47, 42, 43)
-CROP_SHIFT = (0, 0)
+FIXTURE_SLOT_NAMES = {"G": G_SLOT_NAMES, "S": S_SLOT_NAMES}
+EXPECTED_CROP_OFFSETS = {
+    "G": (-38, -47, 42, 43),
+    "S": (-28, -34, 143, 96),
+}
 MAX_SEATED_CAP_OFFSET_M = 0.0015
 DAMAGE_KINDS = ("crush", "bend", "lean_crush", "broken_top")
 DAMAGE_WEIGHTS = (0.30, 0.20, 0.25, 0.25)
@@ -37,6 +42,73 @@ MAX_DAMAGE_ATTEMPTS = 10
 MIN_CRUSH_SHIFT_M = 0.003
 MIN_BEND_SHIFT_M = 0.006
 MIN_LEAN_DEGREES = 10.0
+
+
+def labeler_grid_center(grid, position: int) -> tuple[float, float]:
+    if not 1 <= position <= 30:
+        raise ValueError("position must be from 1 through 30")
+    column, row = divmod(position - 1, 5)
+    u = 1.0 - column / 5.0
+    v = row / 4.0
+    top_left, top_right, bottom_left, bottom_right = grid
+    x = (1.0 - v) * (
+        (1.0 - u) * top_left[0] + u * top_right[0]
+    ) + v * ((1.0 - u) * bottom_left[0] + u * bottom_right[0])
+    y = (1.0 - v) * (
+        (1.0 - u) * top_left[1] + u * top_right[1]
+    ) + v * ((1.0 - u) * bottom_left[1] + u * bottom_right[1])
+    return float(x), float(y)
+
+
+def load_labeler_geometry(path: Path) -> dict[str, object]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("image_size") != [1920, 1080]:
+        raise ValueError("Labeler calibration must target 1920x1080 images")
+    profiles = document.get("profiles", [])
+    profile = next(
+        (candidate for candidate in profiles if candidate.get("id") == "view_001"),
+        None,
+    )
+    if profile is None:
+        raise ValueError("Labeler calibration is missing profile 'view_001'")
+    geometry = {}
+    for prefix, area_name in (("G", "good"), ("S", "scrap")):
+        area = profile["areas"][area_name]
+        offsets = tuple(int(value) for value in area["crop_offsets"])
+        if offsets != EXPECTED_CROP_OFFSETS[prefix]:
+            raise ValueError(
+                f"Unexpected {prefix} crop offsets {offsets}; "
+                f"expected {EXPECTED_CROP_OFFSETS[prefix]}"
+            )
+        geometry[prefix] = {
+            "area": area_name,
+            "grid": area["grid"],
+            "crop_offsets": offsets,
+            "centers": {
+                f"{prefix}{position:02d}": labeler_grid_center(
+                    area["grid"], position
+                )
+                for position in range(1, 31)
+            },
+        }
+    return {"profile": profile["id"], "fixtures": geometry}
+
+
+def translated_crop_centers(
+    geometry: dict[str, object], offset: tuple[int, int] | list[int]
+) -> dict[str, list[float]]:
+    if len(offset) != 2:
+        raise ValueError("crop translation must contain dx and dy")
+    centers = {
+        name: [
+            geometry["fixtures"][name[0]]["centers"][name][0] + offset[0],
+            geometry["fixtures"][name[0]]["centers"][name][1] + offset[1],
+        ]
+        for name in ALL_SLOT_NAMES
+    }
+    if len(centers) != 60:
+        raise AssertionError("Expected 60 translated G/S crop centers")
+    return centers
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,6 +269,7 @@ def main() -> None:
         theta_max = float(camera["theta_max"])
         if camera.get("model") != "opencv_fisheye":
             raise ValueError("camera_fit.json must use model='opencv_fisheye'")
+        labeler_geometry = load_labeler_geometry(LABELER_CALIBRATION_PATH)
         rotation_world_to_cv = np.asarray(camera["R_world_to_cv"], dtype=np.float64)
         camera_position = np.asarray(camera["position_m"], dtype=np.float64)
         render_width, render_height, render_focal, map_x, map_y = build_remap(
@@ -301,13 +374,114 @@ def main() -> None:
         bbox_cache = UsdGeom.BBoxCache(
             time_code, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render]
         )
+
+        def bounds_for(prim):
+            bounds = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+            return (
+                np.asarray(bounds.GetMin(), dtype=np.float64),
+                np.asarray(bounds.GetMax(), dtype=np.float64),
+            )
+
+        template_parts = {}
+        for part in ("tube", "cap"):
+            prim = stage.GetPrimAtPath(f"/TrayInspection/G01_{part}")
+            if not prim.IsValid():
+                raise RuntimeError(f"Missing S clone template: G01_{part}")
+            minimum, maximum = bounds_for(prim)
+            template_parts[part] = {
+                "prim": prim,
+                "world": UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+                    time_code
+                ),
+                "minimum": minimum,
+                "maximum": maximum,
+            }
+        template_cap_center = (
+            template_parts["cap"]["minimum"] + template_parts["cap"]["maximum"]
+        ) / 2.0
+        fit_zmode = str(camera["zmode"])
+        if fit_zmode == "cap_min":
+            template_label_z = float(template_parts["cap"]["minimum"][2])
+        elif fit_zmode == "tube_max":
+            template_label_z = float(template_parts["tube"]["maximum"][2])
+        elif fit_zmode == "cap_center":
+            template_label_z = float(template_cap_center[2])
+        elif fit_zmode == "tube_min":
+            template_label_z = float(template_parts["tube"]["minimum"][2])
+        else:
+            raise ValueError(f"Unsupported camera zmode: {fit_zmode}")
+        template_label_point = np.array(
+            [template_cap_center[0], template_cap_center[1], template_label_z],
+            dtype=np.float64,
+        )
+
+        def pixel_on_world_plane(pixel, world_z):
+            normalized = fisheye_pixels_to_pinhole_normalized(
+                np.asarray([pixel], dtype=np.float64), focal, k1, k2
+            )[0]
+            camera_ray = np.array(
+                [normalized[0], normalized[1], 1.0], dtype=np.float64
+            )
+            world_ray = rotation_world_to_cv.T @ camera_ray
+            if abs(float(world_ray[2])) < 1.0e-9:
+                raise RuntimeError("S slot ray is parallel to the rack plane")
+            distance = (world_z - camera_position[2]) / world_ray[2]
+            if distance <= 0.0:
+                raise RuntimeError("S slot plane lies behind the fitted camera")
+            return camera_position + distance * world_ray
+
+        for name in S_SLOT_NAMES:
+            for part in ("tube", "cap"):
+                authored = stage.GetPrimAtPath(f"/TrayInspection/{name}_{part}")
+                if authored.IsValid():
+                    set_visible(authored, False)
+
+        synthetic_s_root = UsdGeom.Xform.Define(stage, "/SyntheticSFixtures")
+        set_visible(synthetic_s_root.GetPrim(), True)
+        s_prim_paths = {}
+        for name in S_SLOT_NAMES:
+            target_point = pixel_on_world_plane(
+                labeler_geometry["fixtures"]["S"]["centers"][name],
+                template_label_z,
+            )
+            delta = target_point - template_label_point
+            s_prim_paths[name] = {}
+            for part in ("tube", "cap"):
+                path = f"/SyntheticSFixtures/{name}_{part}"
+                clone = stage.DefinePrim(path, "Xform")
+                clone.GetReferences().AddInternalReference(
+                    f"/TrayInspection/G01_{part}"
+                )
+                clone.SetInstanceable(False)
+                xform = UsdGeom.Xformable(clone)
+                xform.ClearXformOpOrder()
+                transform_op = xform.AddTransformOp()
+                transform_op.Set(
+                    template_parts[part]["world"] * translation(delta)
+                )
+                set_visible(clone, True)
+                s_prim_paths[name][part] = path
+        kit.update()
+        bbox_cache.Clear()
+
+        slot_prim_paths = {
+            **{
+                name: {
+                    part: f"/TrayInspection/{name}_{part}"
+                    for part in ("tube", "cap")
+                }
+                for name in G_SLOT_NAMES
+            },
+            **s_prim_paths,
+        }
         slot_info = {}
-        for name in SLOT_NAMES:
+        for name in ALL_SLOT_NAMES:
             record = {}
             for part in ("tube", "cap"):
-                prim = stage.GetPrimAtPath(f"/TrayInspection/{name}_{part}")
+                prim_path = slot_prim_paths[name][part]
+                prim = stage.GetPrimAtPath(prim_path)
                 if not prim.IsValid():
-                    raise RuntimeError(f"Missing prim: {name}_{part}")
+                    raise RuntimeError(f"Missing prim: {prim_path}")
                 if part == "tube" and prim.IsInstance():
                     prim.SetInstanceable(False)
                     kit.update()
@@ -317,13 +491,13 @@ def main() -> None:
                     .ComputeLocalToWorldTransform(time_code)
                     .GetInverse()
                 )
-                bounds = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+                minimum, maximum = bounds_for(prim)
                 record[part] = {
                     "prim": prim,
                     "world": world,
                     "parent_inverse": parent_inverse,
-                    "minimum": np.asarray(bounds.GetMin(), dtype=np.float64),
-                    "maximum": np.asarray(bounds.GetMax(), dtype=np.float64),
+                    "minimum": minimum,
+                    "maximum": maximum,
                 }
             slot_info[name] = record
 
@@ -966,15 +1140,15 @@ def main() -> None:
                 "position_jitter_m": jitter,
             }
 
-        def write_crop(image, center, path):
-            shifted_x = int(round(center[0] + CROP_SHIFT[0]))
-            shifted_y = int(round(center[1] + CROP_SHIFT[1]))
-            x0 = shifted_x + CROP_OFFSETS[0]
-            y0 = shifted_y + CROP_OFFSETS[1]
-            x1 = shifted_x + CROP_OFFSETS[2]
-            y1 = shifted_y + CROP_OFFSETS[3]
+        def write_crop(image, center, offsets, path):
+            center_x = int(round(center[0]))
+            center_y = int(round(center[1]))
+            x0 = center_x + offsets[0]
+            y0 = center_y + offsets[1]
+            x1 = center_x + offsets[2]
+            y1 = center_y + offsets[3]
             crop = np.zeros(
-                (CROP_OFFSETS[3] - CROP_OFFSETS[1], CROP_OFFSETS[2] - CROP_OFFSETS[0], 3),
+                (offsets[3] - offsets[1], offsets[2] - offsets[0], 3),
                 dtype=image.dtype,
             )
             source_x0 = max(0, x0)
@@ -1000,16 +1174,27 @@ def main() -> None:
             image_name = f"{args.prefix}img_{image_index:04d}"
             image_seed = master_rng.randrange(0, 2**63)
             scene_rng = random.Random(image_seed)
-            fill_scene = sample_fill_scene(
-                scene_rng,
-                class_balance=args.class_balance,
-                damage_weight=args.damage_weight,
-            )
-            labels = dict(fill_scene.labels)
-            requested_shift_px = [
-                scene_rng.uniform(-20.0, 20.0),
-                scene_rng.uniform(-20.0, 20.0),
+            fixture_scenes = {
+                prefix: sample_fill_scene(
+                    scene_rng,
+                    prefix=prefix,
+                    class_balance=args.class_balance,
+                    damage_weight=args.damage_weight,
+                )
+                for prefix in ("G", "S")
+            }
+            labels = {
+                name: label
+                for prefix in ("G", "S")
+                for name, label in fixture_scenes[prefix].labels.items()
+            }
+            if len(labels) != 60 or set(labels) != set(ALL_SLOT_NAMES):
+                raise AssertionError("Each image must contain exactly 60 G/S labels")
+            shared_offset_px = [
+                scene_rng.randint(-15, 15),
+                scene_rng.randint(-15, 15),
             ]
+            requested_shift_px = list(shared_offset_px)
             rotation_jitter_deg = [
                 scene_rng.uniform(-0.5, 0.5),
                 scene_rng.uniform(-0.5, 0.5),
@@ -1034,6 +1219,9 @@ def main() -> None:
                 name: project(point, jittered_rotation, jittered_position)
                 for name, point in label_world_points.items()
             }
+            crop_centers = translated_crop_centers(
+                labeler_geometry, shared_offset_px
+            )
             camera_jitter = {
                 "requested_shift_px": requested_shift_px,
                 "translation_world_m": translation_world.tolist(),
@@ -1042,7 +1230,7 @@ def main() -> None:
                 "R_world_to_cv": jittered_rotation.tolist(),
             }
             variations = {}
-            for slot_name in SLOT_NAMES:
+            for slot_name in ALL_SLOT_NAMES:
                 variations[slot_name] = apply_slot(
                     slot_name,
                     labels,
@@ -1084,26 +1272,50 @@ def main() -> None:
                 borderMode=cv2.BORDER_CONSTANT,
             )
             image_path = output_images / f"{image_name}.png"
-            if not args.crops_only or image_index < 3:
+            write_full_image = not args.crops_only or image_index < 3
+            if write_full_image:
                 if not cv2.imwrite(str(image_path), final_image):
                     raise OSError(f"Could not write image: {image_path}")
-            for slot_name in SLOT_NAMES:
+            for slot_name in ALL_SLOT_NAMES:
+                fixture = slot_name[0]
                 write_crop(
                     final_image,
-                    projected_centers[slot_name],
+                    crop_centers[slot_name],
+                    labeler_geometry["fixtures"][fixture]["crop_offsets"],
                     output_crops / f"{image_name}_{slot_name}.png",
                 )
 
             image_records.append(
                 {
                     "image": image_name,
+                    "full_image_path": (
+                        f"images/{image_name}.png" if write_full_image else None
+                    ),
                     "labels": labels,
-                    "not_yet_filled": fill_scene.not_yet_filled,
-                    "expected_through": fill_scene.expected_through,
-                    "missed_position": fill_scene.missed_position,
+                    "not_yet_filled": [
+                        name
+                        for prefix in ("G", "S")
+                        for name in fixture_scenes[prefix].not_yet_filled
+                    ],
+                    "fixture_state": {
+                        prefix: {
+                            "expected_through": fixture_scenes[
+                                prefix
+                            ].expected_through,
+                            "missed_position": fixture_scenes[
+                                prefix
+                            ].missed_position,
+                            "not_yet_filled": fixture_scenes[
+                                prefix
+                            ].not_yet_filled,
+                        }
+                        for prefix in ("G", "S")
+                    },
                     "lights": lights,
                     "seed": image_seed,
+                    "shared_offset_px": shared_offset_px,
                     "camera_jitter": camera_jitter,
+                    "crop_centers": crop_centers,
                     "projected_centers": projected_centers,
                     "variations": variations,
                     "damaged_positions": {
@@ -1133,12 +1345,45 @@ def main() -> None:
                     "render_size": [render_width, render_height],
                     "width_scale": args.width_scale,
                 },
-                "crop_offsets": list(CROP_OFFSETS),
-                "crop_shift": list(CROP_SHIFT),
-                "positions": nominal_projected_centers,
+                "crop_geometry": {
+                    "source": "labeler_calibration",
+                    "profile": labeler_geometry["profile"],
+                    "fixtures": {
+                        prefix: {
+                            "grid": labeler_geometry["fixtures"][prefix]["grid"],
+                            "crop_offsets": list(
+                                labeler_geometry["fixtures"][prefix][
+                                    "crop_offsets"
+                                ]
+                            ),
+                            "crop_size": [
+                                labeler_geometry["fixtures"][prefix][
+                                    "crop_offsets"
+                                ][2]
+                                - labeler_geometry["fixtures"][prefix][
+                                    "crop_offsets"
+                                ][0],
+                                labeler_geometry["fixtures"][prefix][
+                                    "crop_offsets"
+                                ][3]
+                                - labeler_geometry["fixtures"][prefix][
+                                    "crop_offsets"
+                                ][1],
+                            ],
+                        }
+                        for prefix in ("G", "S")
+                    },
+                },
+                "positions": {
+                    name: list(
+                        labeler_geometry["fixtures"][name[0]]["centers"][name]
+                    )
+                    for name in ALL_SLOT_NAMES
+                },
+                "twin_projected_positions": nominal_projected_centers,
                 "deformation_backends": {
                     name: slot_info[name]["tube"]["deformation_backend"]
-                    for name in SLOT_NAMES
+                    for name in ALL_SLOT_NAMES
                 },
                 "images": image_records,
             }
