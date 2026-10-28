@@ -29,6 +29,7 @@ CAMERA_PATH = Path("/job/in/cameras/camera_fit.json")
 STAGE_PATH = "/job/in/stations/tray_inspection/tray_inspection.usdc"
 CROP_OFFSETS = (-38, -47, 42, 43)
 CROP_SHIFT = (0, 0)
+MAX_SEATED_CAP_OFFSET_M = 0.0015
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path("/job/out"))
     parser.add_argument("--subframes", type=int, default=24)
+    parser.add_argument(
+        "--camera-view",
+        default="top",
+        help="Camera view to render (only 'top' is implemented).",
+    )
+    parser.add_argument(
+        "--allow-split-rim",
+        action="store_true",
+        help="Allow the legacy split-rim damaged-vial variant.",
+    )
     parser.add_argument(
         "--defect-boost",
         type=float,
@@ -124,6 +135,10 @@ def main() -> None:
             raise ValueError("--n must be at least 1")
         if args.defect_boost <= 0.0:
             raise ValueError("--defect-boost must be positive")
+        if args.camera_view != "top":
+            raise NotImplementedError(
+                f"Camera view {args.camera_view!r} is not implemented; use 'top'"
+            )
         ensure_external_output(args.out)
 
         import cv2
@@ -269,6 +284,32 @@ def main() -> None:
                 }
             slot_info[name] = record
 
+        # Keep damage within the slot's conservative circular cell. The cap is
+        # the widest part that follows the displaced mouth, so reserve its
+        # full radius when limiting lateral deformation.
+        slot_centers = {
+            name: (record["tube"]["minimum"][:2] + record["tube"]["maximum"][:2])
+            / 2.0
+            for name, record in slot_info.items()
+        }
+        for name, record in slot_info.items():
+            center = slot_centers[name]
+            nearest_neighbor_distance = min(
+                float(np.linalg.norm(center - other_center))
+                for other_name, other_center in slot_centers.items()
+                if other_name != name
+            )
+            cap_size = (
+                record["cap"]["maximum"][:2] - record["cap"]["minimum"][:2]
+            )
+            cap_radius = float(np.linalg.norm(cap_size / 2.0))
+            record["tube"]["max_lateral_shift_m"] = max(
+                0.0,
+                nearest_neighbor_distance / 2.0
+                - cap_radius
+                - MAX_SEATED_CAP_OFFSET_M,
+            )
+
         # Replace authored transform stacks with one session-layer transform,
         # matching the v1 generator while leaving source USD untouched.
         for record in slot_info.values():
@@ -405,11 +446,12 @@ def main() -> None:
                 float(tube["maximum"][2] - tube["minimum"][2]), 1.0e-6
             )
             if damage_kind == "crush":
-                base_radius_scale = scene_rng.uniform(0.45, 0.70)
-                squeeze_amount = min((1.0 - base_radius_scale) * defect_boost, 0.75)
+                base_radius_scale = scene_rng.uniform(0.35, 0.60)
+                squeeze_amount = min((1.0 - base_radius_scale) * defect_boost, 0.85)
                 effective_radius_scale = 1.0 - squeeze_amount
                 band_shift_m = min(
-                    scene_rng.uniform(0.003, 0.006) * defect_boost, 0.010
+                    scene_rng.uniform(0.004, 0.008) * defect_boost,
+                    tube["max_lateral_shift_m"],
                 )
                 bend_shift = band_shift_m * direction
                 parameters.update(
@@ -419,7 +461,8 @@ def main() -> None:
                 )
             elif damage_kind == "bend":
                 amplitude = min(
-                    scene_rng.uniform(0.006, 0.012) * defect_boost, 0.014
+                    scene_rng.uniform(0.009, 0.015) * defect_boost,
+                    tube["max_lateral_shift_m"],
                 )
                 bend_shift = amplitude * direction
                 bend_degrees = math.degrees(math.atan2(2.0 * amplitude, tube_height))
@@ -460,7 +503,7 @@ def main() -> None:
 
                 if damage_kind == "crush":
                     upper_weight = np.clip(
-                        (normalized_height - 0.30) / 0.10, 0.0, 1.0
+                        (normalized_height - 0.40) / 0.10, 0.0, 1.0
                     )
                     upper_weight = upper_weight * upper_weight * (
                         3.0 - 2.0 * upper_weight
@@ -518,18 +561,20 @@ def main() -> None:
             base_scale = 1.0
             if damage_kind == "crush":
                 base_scale = max(
-                    0.25,
+                    0.15,
                     1.0
-                    - (1.0 - scene_rng.uniform(0.45, 0.70)) * defect_boost,
+                    - (1.0 - scene_rng.uniform(0.35, 0.60)) * defect_boost,
                 )
                 band_shift = min(
-                    scene_rng.uniform(0.003, 0.006) * defect_boost, 0.010
+                    scene_rng.uniform(0.004, 0.008) * defect_boost,
+                    tube["max_lateral_shift_m"],
                 ) * direction
                 mouth_shift = band_shift.copy()
                 strength = 1.0 - base_scale
             elif damage_kind == "bend":
                 mouth_shift = min(
-                    scene_rng.uniform(0.006, 0.012) * defect_boost, 0.014
+                    scene_rng.uniform(0.009, 0.015) * defect_boost,
+                    tube["max_lateral_shift_m"],
                 ) * direction
                 band_shift = np.zeros(2, dtype=np.float64)
                 strength = float(np.linalg.norm(mouth_shift))
@@ -545,21 +590,33 @@ def main() -> None:
             for segment in tube["fallback_segments"]:
                 fraction = (segment["index"] + 0.5) / 3.0
                 upper = float(segment["index"] >= 1)
+                curved_shift = (
+                    mouth_shift * fraction**2
+                    if damage_kind == "bend"
+                    else np.zeros(2, dtype=np.float64)
+                )
                 center = [
                     float(
                         segment["center_xy"][0]
-                        + mouth_shift[0] * fraction**2
+                        + curved_shift[0]
                         + band_shift[0] * upper
                     ),
                     float(
                         segment["center_xy"][1]
-                        + mouth_shift[1] * fraction**2
+                        + curved_shift[1]
                         + band_shift[1] * upper
                     ),
                     float(segment["base_z"] + segment["height"] * fraction),
                 ]
-                bend_degrees = math.degrees(
-                    math.atan2(2.0 * np.linalg.norm(mouth_shift) * fraction, segment["height"])
+                bend_degrees = (
+                    math.degrees(
+                        math.atan2(
+                            2.0 * np.linalg.norm(mouth_shift) * fraction,
+                            segment["height"],
+                        )
+                    )
+                    if damage_kind == "bend"
+                    else 0.0
                 )
                 bend_axis = (-direction[1], direction[0], 0.0)
                 segment_scale = 1.0
@@ -622,7 +679,7 @@ def main() -> None:
             cap_world = cap_world * lean_matrix
 
             cap_yaw = scene_rng.uniform(-180.0, 180.0)
-            offset_radius = scene_rng.uniform(0.0, 0.00149)
+            offset_radius = scene_rng.uniform(0.0, MAX_SEATED_CAP_OFFSET_M)
             offset_angle = scene_rng.uniform(0.0, 2.0 * math.pi)
             cap_offset = (
                 offset_radius * math.cos(offset_angle),
@@ -665,7 +722,12 @@ def main() -> None:
                 )
                 variation["crooked_tilt_deg"] = crooked_degrees
             elif label == "damaged_vial":
-                damage_kind = scene_rng.choice(("crush", "bend", "split_rim"))
+                if args.allow_split_rim and scene_rng.random() < 1.0 / 3.0:
+                    damage_kind = "split_rim"
+                else:
+                    damage_kind = scene_rng.choices(
+                        ("crush", "bend"), weights=(0.60, 0.40), k=1
+                    )[0]
                 if tube["deformation_backend"] == "mesh_points":
                     damage, mouth_shift, mouth_tilt, bend_direction = deform_mesh_points(
                         tube, damage_kind, scene_rng, defect_boost
@@ -888,6 +950,8 @@ def main() -> None:
                 "generation": {
                     "defect_boost": args.defect_boost,
                     "class_balance": args.class_balance,
+                    "allow_split_rim": args.allow_split_rim,
+                    "camera_view": args.camera_view,
                 },
                 "camera": {
                     "model": "opencv_fisheye",
