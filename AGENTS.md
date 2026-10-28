@@ -1,5 +1,23 @@
 # Repository Guidelines
 
+## Project Scope
+
+This repository is for Challenge 1, Final Vial Inspection, in the Rockwell Automation/NVIDIA hackathon. Classify all 30 positions in each of the two fixtures, G and S, as one of `pass`, `missing_cap`, `crooked_cap`, `damaged_vial`, or `no_vial`.
+
+## Data and Evaluation Rules
+
+- Train only on digital-twin images.
+- Use real images for testing only; never include them in training, validation, augmentation sources, or model selection.
+- Optimize decisions with the asymmetric cost in mind: a missed defect costs more than a false alarm.
+- Never commit data, model weights, renders, tokens, keys, or passwords.
+
+## Development Workflow
+
+- Write code on the laptop and copy it to the Spark with `scp`.
+- Reach the Spark over the CSI VPN with `ssh yt-jit3783@172.30.102.95`.
+- Run headless Isaac Sim as a YAAD pool job using the arm64 image `nvcr.io/nvidia/isaac-sim:5.1.0`.
+- Treat the Spark workspace as temporary; its files are kept only until the event ends.
+
 ## Project Structure & Module Organization
 
 This repository is currently a project scaffold: `README.md` contains the hackathon brief and submission requirements. As implementation begins, keep code under `src/`, tests under `tests/`, and documentation assets under `docs/` or `assets/`. Group code by responsibility (for example, `src/data/`, `src/models/`, and `src/inference/`). Store experiment settings in `configs/`. Do not commit datasets, checkpoints, model weights, or generated videos; document their download or generation steps and add their paths to `.gitignore`.
@@ -30,4 +48,4 @@ The history currently contains only `Initial commit`, so no established conventi
 
 ## Security & Configuration
 
-Keep API keys, tokens, credentials, and machine-specific settings in ignored environment files. Commit an `.env.example` containing names only. Before pushing, check `git status` and confirm that outputs and sensitive files are excluded.
+Keep API keys, tokens, credentials, and machine-specific settings in ignored environment files. Never commit data, model weights, renders, tokens, keys, or passwords. Before pushing, check `git status` and confirm that outputs and sensitive files are excluded.
