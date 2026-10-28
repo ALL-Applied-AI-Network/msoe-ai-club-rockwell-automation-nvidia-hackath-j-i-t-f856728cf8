@@ -17,11 +17,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from fill_logic import SLOT_NAMES, sample_fill_scene
+from fisheye import (
+    PRINCIPAL_POINT,
+    invert_theta,
+    project_world,
+)
 
 
 CAMERA_PATH = Path("/job/in/cameras/camera_fit.json")
 STAGE_PATH = "/job/in/stations/tray_inspection/tray_inspection.usdc"
-PRINCIPAL_POINT = (960.0, 540.0)
 CROP_OFFSETS = (-38, -47, 42, 43)
 CROP_SHIFT = (8, -12)
 
@@ -52,7 +56,15 @@ def ensure_external_output(path: Path) -> None:
         raise ValueError(f"Refusing to write generated data inside source tree: {path}")
 
 
-def build_remap(width: int, height: int, focal: float, k1: float, width_scale: float):
+def build_remap(
+    width: int,
+    height: int,
+    focal: float,
+    k1: float,
+    k2: float,
+    theta_max: float,
+    width_scale: float,
+):
     import numpy as np
 
     if width_scale <= 0.0:
@@ -62,83 +74,26 @@ def build_remap(width: int, height: int, focal: float, k1: float, width_scale: f
         np.arange(width, dtype=np.float32),
         np.arange(height, dtype=np.float32),
     )
-    distorted_x = (grid_x.astype(np.float64) - cx) / focal
-    distorted_y = (grid_y.astype(np.float64) - cy) / focal
-    distorted_radius = np.sqrt(distorted_x**2 + distorted_y**2)
+    delta_x = grid_x.astype(np.float64) - cx
+    delta_y = grid_y.astype(np.float64) - cy
+    radius_px = np.sqrt(delta_x**2 + delta_y**2)
+    theta_d = radius_px / focal
+    theta = invert_theta(theta_d, k1, k2, upper=theta_max)
+    pinhole_radius = np.tan(theta)
+    radial_scale = np.zeros_like(radius_px)
+    nonzero = radius_px > 1.0e-12
+    radial_scale[nonzero] = pinhole_radius[nonzero] / radius_px[nonzero]
+    ideal_x = delta_x * radial_scale
+    ideal_y = delta_y * radial_scale
 
-    # Solve rd = ru * (1 + k1 * ru^2). For negative k1, the fitted model can
-    # become non-monotonic outside the calibrated region. Use the central,
-    # forward-facing root where it exists and the exact outer algebraic root
-    # where it does not, rather than letting an iterative inverse diverge.
-    ideal_radius = np.empty_like(distorted_radius)
-    nonphysical = np.zeros_like(distorted_radius, dtype=bool)
-    if abs(k1) < 1.0e-12:
-        ideal_radius[:] = distorted_radius
-    elif k1 > 0.0:
-        ideal_radius[:] = distorted_radius
-        for _ in range(20):
-            function = ideal_radius * (1.0 + k1 * ideal_radius**2) - distorted_radius
-            derivative = 1.0 + 3.0 * k1 * ideal_radius**2
-            ideal_radius -= function / derivative
-    else:
-        critical_radius = math.sqrt(-1.0 / (3.0 * k1))
-        maximum_distorted_radius = critical_radius * (
-            1.0 + k1 * critical_radius**2
-        )
-        central = distorted_radius <= maximum_distorted_radius
-        low = np.zeros_like(distorted_radius)
-        high = np.full_like(distorted_radius, critical_radius)
-        for _ in range(50):
-            middle = (low + high) / 2.0
-            mapped = middle * (1.0 + k1 * middle**2)
-            low = np.where((mapped < distorted_radius) & central, middle, low)
-            high = np.where((mapped >= distorted_radius) & central, middle, high)
-        ideal_radius[central] = ((low + high) / 2.0)[central]
-
-        nonphysical = ~central
-        outer_high = np.full_like(
-            distorted_radius, -math.sqrt(-1.0 / k1)
-        )
-        outer_low = -(
-            2.0 * math.sqrt(-1.0 / k1)
-            + 2.0 * np.cbrt(distorted_radius / (-k1))
-            + 1.0
-        )
-        for _ in range(60):
-            middle = (outer_low + outer_high) / 2.0
-            mapped = middle * (1.0 + k1 * middle**2)
-            outer_low = np.where(
-                (mapped > distorted_radius) & nonphysical, middle, outer_low
-            )
-            outer_high = np.where(
-                (mapped <= distorted_radius) & nonphysical, middle, outer_high
-            )
-        ideal_radius[nonphysical] = (
-            (outer_low + outer_high) / 2.0
-        )[nonphysical]
-
-    radial_scale = np.ones_like(distorted_radius)
-    nonzero = distorted_radius > 1.0e-12
-    radial_scale[nonzero] = ideal_radius[nonzero] / distorted_radius[nonzero]
-    ideal = np.stack(
-        [distorted_x * radial_scale, distorted_y * radial_scale], axis=2
-    )
-    forward_radius = ideal_radius * (1.0 + k1 * ideal_radius**2)
-    if float(np.max(np.abs(forward_radius - distorted_radius))) > 1.0e-8:
-        raise RuntimeError("Radial inverse did not satisfy the fitted distortion model")
-
-    # The pinhole canvas is centered on the optical axis. Its half-extents are
-    # derived from every inverse-distorted output pixel, including the corners.
-    half_width = int(math.ceil(focal * float(np.max(np.abs(ideal[..., 0]))))) + 3
-    half_height = int(math.ceil(focal * float(np.max(np.abs(ideal[..., 1]))))) + 3
-    full_width = max(width, 2 * half_width)
-    full_height = max(height, 2 * half_height)
-    render_width = max(64, int(math.ceil(full_width * width_scale)) + 4)
-    render_height = max(64, int(math.ceil(full_height * width_scale)) + 4)
+    # theta_max already includes a ten-percent angular margin. The additional
+    # five-percent pixel margin prevents interpolation at the render boundary.
+    full_extent = 2.0 * focal * math.tan(theta_max) * 1.05
+    render_width = max(64, int(math.ceil(full_extent * width_scale)))
+    render_height = render_width
     render_focal = focal * width_scale
-
-    map_x = (ideal[..., 0] * render_focal + render_width / 2.0).astype(np.float32)
-    map_y = (ideal[..., 1] * render_focal + render_height / 2.0).astype(np.float32)
+    map_x = (ideal_x * render_focal + render_width / 2.0).astype(np.float32)
+    map_y = (ideal_y * render_focal + render_height / 2.0).astype(np.float32)
     if (
         map_x.min() < -0.01
         or map_y.min() < -0.01
@@ -146,14 +101,7 @@ def build_remap(width: int, height: int, focal: float, k1: float, width_scale: f
         or map_y.max() > render_height - 1 + 0.01
     ):
         raise RuntimeError("Computed pinhole render does not cover every final pixel")
-    return (
-        render_width,
-        render_height,
-        render_focal,
-        map_x,
-        map_y,
-        int(np.count_nonzero(nonphysical)),
-    )
+    return render_width, render_height, render_focal, map_x, map_y
 
 
 def main() -> None:
@@ -173,22 +121,15 @@ def main() -> None:
             raise ValueError(f"Expected fitted image size 1920x1080, got {width}x{height}")
         focal = float(camera["focal_px"])
         k1 = float(camera["k1"])
+        k2 = float(camera["k2"])
+        theta_max = float(camera["theta_max"])
+        if camera.get("model") != "opencv_fisheye":
+            raise ValueError("camera_fit.json must use model='opencv_fisheye'")
         rotation_world_to_cv = np.asarray(camera["R_world_to_cv"], dtype=np.float64)
         camera_position = np.asarray(camera["position_m"], dtype=np.float64)
-        (
-            render_width,
-            render_height,
-            render_focal,
-            map_x,
-            map_y,
-            nonphysical_remap_pixels,
-        ) = build_remap(width, height, focal, k1, args.width_scale)
-        if nonphysical_remap_pixels:
-            print(
-                "warning: fitted radial model has no forward-facing inverse for "
-                f"{nonphysical_remap_pixels} output pixels; using its exact outer branch",
-                flush=True,
-            )
+        render_width, render_height, render_focal, map_x, map_y = build_remap(
+            width, height, focal, k1, k2, theta_max, args.width_scale
+        )
 
         from isaacsim import SimulationApp
 
@@ -385,18 +326,14 @@ def main() -> None:
         print(f"deformation backends: {backend_counts}", flush=True)
 
         def project(world_point):
-            camera_point = rotation_world_to_cv @ (
-                np.asarray(world_point, dtype=np.float64) - camera_position
-            )
-            if camera_point[2] <= 0.0:
-                raise RuntimeError("Slot center is behind the fitted camera")
-            x_value = camera_point[0] / camera_point[2]
-            y_value = camera_point[1] / camera_point[2]
-            distortion = 1.0 + k1 * (x_value * x_value + y_value * y_value)
-            return [
-                float(focal * x_value * distortion + PRINCIPAL_POINT[0]),
-                float(focal * y_value * distortion + PRINCIPAL_POINT[1]),
-            ]
+            return project_world(
+                np.asarray([world_point], dtype=np.float64),
+                rotation_world_to_cv,
+                camera_position,
+                focal,
+                k1,
+                k2,
+            )[0].tolist()
 
         projected_centers = {}
         for name, record in slot_info.items():
@@ -772,12 +709,15 @@ def main() -> None:
             labels_document = {
                 "image_size": [width, height],
                 "camera": {
+                    "model": "opencv_fisheye",
                     "focal_px": focal,
                     "k1": k1,
+                    "k2": k2,
                     "principal_point": list(PRINCIPAL_POINT),
+                    "theta_max": theta_max,
+                    "min_dtheta_d": float(camera["min_dtheta_d"]),
                     "render_size": [render_width, render_height],
                     "width_scale": args.width_scale,
-                    "outer_branch_pixels": nonphysical_remap_pixels,
                 },
                 "crop_offsets": list(CROP_OFFSETS),
                 "crop_shift": list(CROP_SHIFT),

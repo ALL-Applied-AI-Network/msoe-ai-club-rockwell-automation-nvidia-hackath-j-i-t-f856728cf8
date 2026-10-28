@@ -1,10 +1,11 @@
-"""Fit a pinhole camera with radial distortion to vial-slot correspondences."""
+"""Fit a monotonic OpenCV-fisheye camera to vial-slot correspondences."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -14,10 +15,25 @@ import numpy as np
 from scipy.optimize import least_squares
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from fisheye import (
+    MAX_PINHOLE_THETA,
+    PRINCIPAL_POINT,
+    corner_theta_max,
+    distortion_derivative,
+    distort_theta,
+    minimum_derivative,
+    project_world,
+)
+
+
 IMAGE_SIZE = (1920, 1080)
-PRINCIPAL_POINT = np.array([960.0, 540.0], dtype=np.float64)
 FOCAL_STARTS = (700.0, 900.0, 1100.0, 1400.0)
 ZMODES = ("tube_min", "tube_max", "cap_center")
+MIN_DERIVATIVE = 0.05
 ANCHOR_PIXELS = {
     "G01": (1078.0, 406.0),
     "G05": (1067.0, 715.0),
@@ -35,36 +51,23 @@ class FitResult:
     anchor_errors_px: np.ndarray
     loo_errors_px: np.ndarray
     loo_rms_px: float
+    theta_max: float
+    min_dtheta_d: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--prims",
-        type=Path,
-        default=Path("calib/twin_prims.json"),
-        help="Twin world-axis bounding boxes.",
+        "--prims", type=Path, default=Path("calib/twin_prims.json")
     )
     parser.add_argument(
         "--init",
         type=Path,
-        help="Optional CapSealCam.json with R_world_to_cv, position_m, and focal_px_final.",
+        help="Optional fisheye camera JSON used as the pose initialization.",
     )
     parser.add_argument("--zmode", choices=ZMODES, default="tube_min")
     parser.add_argument(
-        "--fit-json",
-        type=Path,
-        default=Path("calib/camera_fit.json"),
-    )
-    parser.add_argument(
-        "--image",
-        type=Path,
-        default=Path(r"C:\Users\aamp7\Downloads\real_examples\tray_000001.jpg"),
-    )
-    parser.add_argument(
-        "--check-image",
-        type=Path,
-        default=Path(r"C:\Users\aamp7\Downloads\fit_check\tray_000001_fit.png"),
+        "--fit-json", type=Path, default=Path("calib/camera_fit.json")
     )
     return parser.parse_args()
 
@@ -73,8 +76,7 @@ def load_boxes(path: Path) -> dict[str, np.ndarray]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"Expected a JSON object in {path}")
-
-    boxes: dict[str, np.ndarray] = {}
+    boxes = {}
     for prim_path, bounds in raw.items():
         box = np.asarray(bounds, dtype=np.float64)
         if box.shape != (2, 3) or not np.isfinite(box).all():
@@ -83,32 +85,28 @@ def load_boxes(path: Path) -> dict[str, np.ndarray]:
     return boxes
 
 
-def find_box(boxes: Mapping[str, np.ndarray], slot: str, kind: str) -> np.ndarray:
-    suffix = f"/{slot}_{kind}"
+def find_box(boxes: Mapping[str, np.ndarray], slot: str, part: str) -> np.ndarray:
+    suffix = f"/{slot}_{part}"
     matches = [box for path, box in boxes.items() if path.endswith(suffix)]
     if len(matches) != 1:
         raise KeyError(f"Expected one box ending in {suffix!r}; found {len(matches)}")
     return matches[0]
 
 
-def slot_point(
-    boxes: Mapping[str, np.ndarray], slot: str, zmode: str
-) -> np.ndarray:
+def slot_point(boxes: Mapping[str, np.ndarray], slot: str, zmode: str) -> np.ndarray:
     tube = find_box(boxes, slot, "tube")
     xy = tube.mean(axis=0)[:2]
     if zmode == "tube_min":
-        z = tube[0, 2]
+        z_value = tube[0, 2]
     elif zmode == "tube_max":
-        z = tube[1, 2]
+        z_value = tube[1, 2]
     elif zmode == "cap_center":
         cap_suffix = f"/{slot}_cap"
         caps = [box for path, box in boxes.items() if path.endswith(cap_suffix)]
-        # Scrap positions can intentionally have no cap primitive. In that case,
-        # the tube top is the closest defined surface for this height choice.
-        z = caps[0][:, 2].mean() if len(caps) == 1 else tube[1, 2]
+        z_value = caps[0][:, 2].mean() if len(caps) == 1 else tube[1, 2]
     else:
         raise ValueError(f"Unknown zmode: {zmode}")
-    return np.array([xy[0], xy[1], z], dtype=np.float64)
+    return np.array([xy[0], xy[1], z_value], dtype=np.float64)
 
 
 def anchor_arrays(
@@ -120,52 +118,84 @@ def anchor_arrays(
     return names, world, pixels
 
 
-def default_initial_pose(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+def default_initial_pose(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
     center = points.mean(axis=0)
     position = np.array([center[0], center[1], center[2] + 1.2])
     rotation = np.diag([-1.0, 1.0, -1.0])
     rotation_vector, _ = cv2.Rodrigues(rotation)
-    return rotation_vector.ravel(), position, 0.0
+    return rotation_vector.ravel(), position, 0.0, 0.0
 
 
 def load_initial_pose(
     init_path: Path | None, points: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
     if init_path is None:
         return default_initial_pose(points)
-
     raw = json.loads(init_path.read_text(encoding="utf-8"))
     rotation = np.asarray(raw["R_world_to_cv"], dtype=np.float64)
     position = np.asarray(raw["position_m"], dtype=np.float64)
     if rotation.shape != (3, 3) or position.shape != (3,):
         raise ValueError("Initial rotation must be 3x3 and position must have 3 values")
     rotation_vector, _ = cv2.Rodrigues(rotation)
-    return rotation_vector.ravel(), position, float(raw.get("k1", 0.0))
+    if raw.get("model") == "opencv_fisheye":
+        return (
+            rotation_vector.ravel(),
+            position,
+            float(raw.get("k1", 0.0)),
+            float(raw.get("k2", 0.0)),
+        )
+    return rotation_vector.ravel(), position, 0.0, 0.0
 
 
-def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+def unpack(params: np.ndarray):
     rotation, _ = cv2.Rodrigues(params[:3].reshape(3, 1))
-    return rotation, params[3:6], float(params[6]), float(params[7])
+    return (
+        rotation,
+        params[3:6],
+        float(params[6]),
+        float(params[7]),
+        float(params[8]),
+    )
+
+
+def fitted_geometry(focal: float, k1: float, k2: float) -> tuple[float, float]:
+    theta_max = corner_theta_max(IMAGE_SIZE, focal, k1, k2)
+    return theta_max, minimum_derivative(k1, k2, theta_max)
 
 
 def project(points: np.ndarray, params: np.ndarray) -> np.ndarray:
-    rotation, position, focal, k1 = unpack(params)
-    camera_points = (rotation @ (points - position).T).T
-    depth = camera_points[:, 2]
-    if np.any(depth <= 1.0e-8):
-        raise ValueError("One or more points project behind the camera")
-    normalized = camera_points[:, :2] / depth[:, None]
-    radius_squared = np.sum(normalized * normalized, axis=1)
-    distortion = 1.0 + k1 * radius_squared
-    return focal * normalized * distortion[:, None] + PRINCIPAL_POINT
+    rotation, position, focal, k1, k2 = unpack(params)
+    return project_world(points, rotation, position, focal, k1, k2)
+
+
+def monotonic_penalty(params: np.ndarray) -> np.ndarray:
+    focal, k1, k2 = (float(params[6]), float(params[7]), float(params[8]))
+    corner_radius = max(
+        math.hypot(u - PRINCIPAL_POINT[0], v - PRINCIPAL_POINT[1])
+        for u, v in ((0.0, 0.0), (1919.0, 0.0), (0.0, 1079.0), (1919.0, 1079.0))
+    )
+    required_theta_d = corner_radius / focal
+    coverage_violation = max(
+        0.0, required_theta_d - float(distort_theta(MAX_PINHOLE_THETA, k1, k2))
+    )
+    try:
+        theta_max = corner_theta_max(IMAGE_SIZE, focal, k1, k2)
+    except ValueError:
+        theta_max = MAX_PINHOLE_THETA
+    theta_samples = np.linspace(0.0, theta_max, 65)
+    derivative = distortion_derivative(theta_samples, k1, k2)
+    derivative_violation = np.maximum(0.0, MIN_DERIVATIVE + 1.0e-4 - derivative)
+    return np.concatenate(
+        [100_000.0 * derivative_violation, [100_000.0 * coverage_violation]]
+    )
 
 
 def residuals(params: np.ndarray, world: np.ndarray, pixels: np.ndarray) -> np.ndarray:
     try:
-        predicted = project(world, params)
+        reprojection = (project(world, params) - pixels).ravel()
     except ValueError:
-        return np.full(pixels.size, 1.0e6, dtype=np.float64)
-    return (predicted - pixels).ravel()
+        reprojection = np.full(pixels.size, 1.0e6, dtype=np.float64)
+    return np.concatenate([reprojection, monotonic_penalty(params)])
 
 
 def parameter_bounds(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -174,12 +204,12 @@ def parameter_bounds(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     lower = np.array(
         [-2.0 * math.pi] * 3
         + [point_min[0] - 3.0, point_min[1] - 3.0, point_max[2] + 0.05]
-        + [200.0, -2.0]
+        + [500.0, -1.0, -1.0]
     )
     upper = np.array(
         [2.0 * math.pi] * 3
         + [point_max[0] + 3.0, point_max[1] + 3.0, point_max[2] + 5.0]
-        + [5000.0, 2.0]
+        + [2500.0, 1.0, 1.0]
     )
     return lower, upper
 
@@ -190,64 +220,90 @@ def fit_multistart(
     initial_rotation: np.ndarray,
     initial_position: np.ndarray,
     initial_k1: float,
+    initial_k2: float,
 ) -> np.ndarray:
     lower, upper = parameter_bounds(world)
     best = None
     for focal in FOCAL_STARTS:
         start = np.concatenate(
-            [initial_rotation, initial_position, [focal, initial_k1]]
+            [initial_rotation, initial_position, [focal, initial_k1, initial_k2]]
         )
-        start = np.clip(start, lower + 1.0e-9, upper - 1.0e-9)
+        start = np.clip(start, lower + 1.0e-8, upper - 1.0e-8)
         result = least_squares(
             residuals,
             start,
             args=(world, pixels),
             bounds=(lower, upper),
             method="trf",
-            x_scale="jac",
-            max_nfev=20_000,
-            ftol=1.0e-11,
-            xtol=1.0e-11,
-            gtol=1.0e-11,
+            x_scale=np.array([1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 1000.0, 0.2, 0.2]),
+            max_nfev=2_500,
+            ftol=1.0e-8,
+            xtol=1.0e-8,
+            gtol=1.0e-8,
         )
-        score = float(np.sum(result.fun * result.fun))
+        try:
+            theta_max, min_derivative_value = fitted_geometry(
+                float(result.x[6]), float(result.x[7]), float(result.x[8])
+            )
+        except ValueError:
+            continue
+        if min_derivative_value <= MIN_DERIVATIVE:
+            continue
+        pixel_residual = residuals(result.x, world, pixels)[: pixels.size]
+        score = float(np.sum(pixel_residual * pixel_residual))
         if best is None or score < best[0]:
-            best = (score, result.x)
+            best = (score, result.x, theta_max, min_derivative_value)
     if best is None:
-        raise RuntimeError("Camera fit produced no result")
+        raise RuntimeError("No monotonic fisheye fit satisfied the field-of-view constraint")
     return best[1]
 
 
 def evaluate_mode(
     boxes: Mapping[str, np.ndarray], zmode: str, init_path: Path | None
-) -> tuple[list[str], np.ndarray, np.ndarray, FitResult]:
+) -> tuple[list[str], FitResult]:
     names, world, pixels = anchor_arrays(boxes, zmode)
-    initial_rotation, initial_position, initial_k1 = load_initial_pose(init_path, world)
+    initial_rotation, initial_position, initial_k1, initial_k2 = load_initial_pose(
+        init_path, world
+    )
     params = fit_multistart(
-        world, pixels, initial_rotation, initial_position, initial_k1
+        world,
+        pixels,
+        initial_rotation,
+        initial_position,
+        initial_k1,
+        initial_k2,
     )
     predicted = project(world, params)
     errors = np.linalg.norm(predicted - pixels, axis=1)
     rms = float(np.sqrt(np.mean(errors * errors)))
 
     loo_errors = []
-    full_rotation = params[:3]
-    full_position = params[3:6]
-    full_k1 = float(params[7])
     for held_out in range(len(names)):
         keep = np.arange(len(names)) != held_out
         loo_params = fit_multistart(
             world[keep],
             pixels[keep],
-            full_rotation,
-            full_position,
-            full_k1,
+            params[:3],
+            params[3:6],
+            float(params[7]),
+            float(params[8]),
         )
         prediction = project(world[held_out : held_out + 1], loo_params)[0]
         loo_errors.append(float(np.linalg.norm(prediction - pixels[held_out])))
     loo_array = np.asarray(loo_errors, dtype=np.float64)
     loo_rms = float(np.sqrt(np.mean(loo_array * loo_array)))
-    return names, world, pixels, FitResult(params, rms, errors, loo_array, loo_rms)
+    theta_max, min_derivative_value = fitted_geometry(
+        float(params[6]), float(params[7]), float(params[8])
+    )
+    return names, FitResult(
+        params=params,
+        rms_px=rms,
+        anchor_errors_px=errors,
+        loo_errors_px=loo_array,
+        loo_rms_px=loo_rms,
+        theta_max=theta_max,
+        min_dtheta_d=min_derivative_value,
+    )
 
 
 def print_mode_details(names: Sequence[str], zmode: str, fit: FitResult) -> None:
@@ -259,96 +315,51 @@ def print_mode_details(names: Sequence[str], zmode: str, fit: FitResult) -> None
         print(f"{name:>6}  {error:12.3f}  {loo_error:12.3f}")
     print(f"RMS: {fit.rms_px:.3f} px")
     print(f"Leave-one-out RMS: {fit.loo_rms_px:.3f} px")
+    print(f"theta_max: {fit.theta_max:.6f} rad")
+    print(f"minimum d(theta_d)/d(theta): {fit.min_dtheta_d:.6f}")
 
 
 def save_fit(path: Path, zmode: str, fit: FitResult) -> None:
-    rotation, position, focal, k1 = unpack(fit.params)
+    rotation, position, focal, k1, k2 = unpack(fit.params)
     payload = {
+        "model": "opencv_fisheye",
         "image_size": list(IMAGE_SIZE),
         "R_world_to_cv": rotation.tolist(),
         "position_m": position.tolist(),
         "focal_px": focal,
         "k1": k1,
+        "k2": k2,
         "zmode": zmode,
         "rms_px": fit.rms_px,
         "loo_rms_px": fit.loo_rms_px,
+        "theta_max": fit.theta_max,
+        "min_dtheta_d": fit.min_dtheta_d,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def ensure_external_image_path(path: Path) -> None:
-    repository = Path.cwd().resolve()
-    resolved = path.resolve()
-    try:
-        resolved.relative_to(repository)
-    except ValueError:
-        return
-    raise ValueError(f"Refusing to write a generated image inside the repository: {path}")
-
-
-def draw_check_image(
-    boxes: Mapping[str, np.ndarray],
-    zmode: str,
-    fit: FitResult,
-    input_path: Path,
-    output_path: Path,
-) -> None:
-    ensure_external_image_path(output_path)
-    image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(f"Could not read image: {input_path}")
-    if (image.shape[1], image.shape[0]) != IMAGE_SIZE:
-        raise ValueError(
-            f"Expected image size {IMAGE_SIZE}; got {(image.shape[1], image.shape[0])}"
-        )
-
-    names = [f"G{index:02d}" for index in range(1, 31)]
-    world = np.vstack([slot_point(boxes, name, zmode) for name in names])
-    pixels = project(world, fit.params)
-    for index, pixel in enumerate(pixels, start=1):
-        center = tuple(np.rint(pixel).astype(int))
-        cv2.circle(image, center, 25, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(
-            image,
-            str(index),
-            (center[0] - 13, center[1] + 7),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(output_path), image):
-        raise OSError(f"Could not write image: {output_path}")
-
-
 def main() -> None:
     args = parse_args()
     boxes = load_boxes(args.prims)
-    evaluated: dict[str, FitResult] = {}
-    names_by_mode: dict[str, list[str]] = {}
-
+    evaluated = {}
     for zmode in ZMODES:
-        names, _, _, fit = evaluate_mode(boxes, zmode, args.init)
-        names_by_mode[zmode] = names
+        names, fit = evaluate_mode(boxes, zmode, args.init)
         evaluated[zmode] = fit
         print_mode_details(names, zmode, fit)
 
     print("\nZ-mode comparison")
-    print("zmode       rms_px  loo_rms_px")
+    print("zmode       rms_px  loo_rms_px  theta_max  min_derivative")
     for zmode in ZMODES:
         fit = evaluated[zmode]
-        print(f"{zmode:<10}  {fit.rms_px:7.3f}  {fit.loo_rms_px:10.3f}")
+        print(
+            f"{zmode:<10}  {fit.rms_px:7.3f}  {fit.loo_rms_px:10.3f}  "
+            f"{fit.theta_max:9.6f}  {fit.min_dtheta_d:14.6f}"
+        )
 
     selected = evaluated[args.zmode]
     save_fit(args.fit_json, args.zmode, selected)
-    draw_check_image(
-        boxes, args.zmode, selected, args.image, args.check_image
-    )
     print(f"\nSaved {args.zmode} fit to {args.fit_json}")
-    print(f"Saved check image to {args.check_image}")
 
 
 if __name__ == "__main__":

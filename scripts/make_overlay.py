@@ -38,6 +38,9 @@ def main() -> None:
     args = parse_args()
     ensure_external_output(args.out)
     document = json.loads((args.results / "labels.json").read_text(encoding="utf-8"))
+    camera = document.get("camera", {})
+    if camera.get("model") != "opencv_fisheye":
+        raise ValueError("labels.json must contain opencv_fisheye camera metadata")
     crop_offsets = document.get("crop_offsets", [-38, -47, 42, 43])
     crop_shift = document.get("crop_shift", [8, -12])
     default_positions = document["positions"]
