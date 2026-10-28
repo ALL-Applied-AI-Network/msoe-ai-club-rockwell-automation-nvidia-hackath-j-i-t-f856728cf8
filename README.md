@@ -1,23 +1,20 @@
 # Final Vial Inspection
 
-Challenge 1 submission for the Rockwell Automation/NVIDIA hackathon.
+Rockwell Automation/NVIDIA Hackathon Challenge 1 project for classifying every vial-fixture position as one of five classes: `pass`, `missing_cap`, `crooked_cap`, `damaged_vial`, or `no_vial`.
 
-## Problem
+## Data rule
 
-Classify each of the 30 positions in fixtures G and S as `pass`, `missing_cap`, `crooked_cap`, `damaged_vial`, or `no_vial`. The evaluation penalizes missed defects more heavily than false alarms.
+Training uses digital-twin images only. Real images are reserved strictly for testing and are never used for training, validation, augmentation, or model selection.
 
-## Approach
+## Repository layout
 
-Train on digital-twin images only and reserve all real images for testing. Document the synthetic-data generation, preprocessing, model, and cost-sensitive decision strategy here.
+- `scripts/gen_tray_v1.py`: versioned digital-twin tray generation script.
+- `scripts/draw_overlay.py`: laptop-side visualization and overlay script.
+- `docs/`: project notes and documentation.
+- `AGENTS.md`: repository rules and development workflow.
 
-## Results
+Datasets, images, generated outputs, model weights, and secrets are excluded from version control.
 
-Add validation and real-image test results here. Report the dataset version, random seed, per-class metrics, confusion matrix, missed-defect rate, and false-alarm rate.
+## Running the scripts
 
-## How to run
-
-Document environment setup, synthetic-data generation, training, evaluation, and inference commands here. Keep datasets, renders, checkpoints, exported models, and secrets outside version control.
-
-## Credits
-
-List team members and credit the hackathon organizers, datasets, models, libraries, code, and other tools used by the project.
+Run digital-twin generation on the DGX Spark through YAAD jobs. Copy scripts from the laptop to the temporary Spark workspace as needed. Run analysis and visualization scripts on the laptop.

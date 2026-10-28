@@ -1,21 +1,45 @@
+# Datasets, generated outputs, and images
+*.png
+*.jpg
+*.jpeg
 data/
+datasets/
+results/
+out/
+gen_test/
+real_examples/
 twin/usd/
 renders/
-results/
-
 *.zip
+
+# Model weights and exports
 *.pt
 *.pth
 *.onnx
 *.engine
+*.ckpt
+*.safetensors
+*.tlt
+*.hdf5
 
-.venv/
+# Secrets
+.env
+*.key
+*.pem
+*token*
+*secret*
+
+# Python junk
 __pycache__/
+.venv/
+*.pyc
 
-*[Aa][Uu][Tt][Hh]*
-*[Tt][Oo][Kk][Ee][Nn]*
-*[Kk][Ee][Yy]*
-.env*
+# OS files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
 
 digital_twin/
 id_ed25519*
