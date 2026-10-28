@@ -41,6 +41,18 @@ class FillLogicTests(unittest.TestCase):
         right = [sample_fill_scene(right_rng) for _ in range(20)]
         self.assertEqual(left, right)
 
+    def test_class_balance_forces_each_requested_defect(self) -> None:
+        rng = random.Random(73)
+        required = {"damaged_vial", "crooked_cap", "missing_cap"}
+        for _ in range(500):
+            scene = sample_fill_scene(rng, class_balance=True)
+            occupied_labels = {
+                scene.labels[slot]
+                for slot in SLOT_NAMES[: scene.expected_through]
+            }
+            self.assertTrue(required.issubset(occupied_labels))
+            self.assertIsNone(scene.missed_position)
+
     def test_distribution_has_endpoints_and_favors_later_stages(self) -> None:
         rng = random.Random(2026)
         counts = Counter()

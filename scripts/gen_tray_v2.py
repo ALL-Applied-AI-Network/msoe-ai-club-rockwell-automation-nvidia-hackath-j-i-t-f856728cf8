@@ -38,6 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=Path("/job/out"))
     parser.add_argument("--subframes", type=int, default=24)
     parser.add_argument(
+        "--defect-boost",
+        type=float,
+        default=1.0,
+        help="Multiply vial deformation magnitudes for inspection renders.",
+    )
+    parser.add_argument(
+        "--class-balance",
+        action="store_true",
+        help="Force damaged, crooked-cap, and missing-cap examples per image.",
+    )
+    parser.add_argument(
         "--width-scale",
         type=float,
         default=1.0,
@@ -111,6 +122,8 @@ def main() -> None:
         args = parse_args()
         if args.n < 1:
             raise ValueError("--n must be at least 1")
+        if args.defect_boost <= 0.0:
+            raise ValueError("--defect-boost must be positive")
         ensure_external_output(args.out)
 
         import cv2
@@ -382,12 +395,54 @@ def main() -> None:
             for segment in tube["fallback_segments"]:
                 set_visible(segment["prim"], False)
 
-        def deform_mesh_points(tube, damage_kind, scene_rng):
+        def deform_mesh_points(tube, damage_kind, scene_rng, defect_boost):
             angle = scene_rng.uniform(0.0, 2.0 * math.pi)
             direction = np.array([math.cos(angle), math.sin(angle)])
-            parameters = {"kind": damage_kind}
+            parameters = {"kind": damage_kind, "boost": defect_boost}
             bend_shift = np.zeros(2, dtype=np.float64)
             bend_degrees = 0.0
+            tube_height = max(
+                float(tube["maximum"][2] - tube["minimum"][2]), 1.0e-6
+            )
+            if damage_kind == "crush":
+                base_radius_scale = scene_rng.uniform(0.45, 0.70)
+                squeeze_amount = min((1.0 - base_radius_scale) * defect_boost, 0.75)
+                effective_radius_scale = 1.0 - squeeze_amount
+                band_shift_m = min(
+                    scene_rng.uniform(0.003, 0.006) * defect_boost, 0.010
+                )
+                bend_shift = band_shift_m * direction
+                parameters.update(
+                    strength=squeeze_amount,
+                    radius_scale=effective_radius_scale,
+                    band_shift_m=(band_shift_m * direction).tolist(),
+                )
+            elif damage_kind == "bend":
+                amplitude = min(
+                    scene_rng.uniform(0.006, 0.012) * defect_boost, 0.014
+                )
+                bend_shift = amplitude * direction
+                bend_degrees = math.degrees(math.atan2(2.0 * amplitude, tube_height))
+                parameters.update(
+                    strength=amplitude,
+                    mouth_shift_m=bend_shift.tolist(),
+                    mouth_tilt_deg=bend_degrees,
+                )
+            elif damage_kind == "split_rim":
+                rim_displacement = min(
+                    scene_rng.uniform(0.002, 0.004) * defect_boost, 0.006
+                )
+                sector_degrees = scene_rng.uniform(60.0, 120.0)
+                rim_mode = scene_rng.choice(("flare", "crush"))
+                parameters.update(
+                    strength=rim_displacement,
+                    rim_mode=rim_mode,
+                    sector_degrees=sector_degrees,
+                    sector_center_degrees=math.degrees(angle),
+                )
+            else:
+                raise ValueError(f"Unknown damage kind: {damage_kind}")
+
             for mesh_record in tube["meshes"]:
                 original = mesh_record["points"]
                 changed = original.copy()
@@ -404,49 +459,47 @@ def main() -> None:
                 )
 
                 if damage_kind == "crush":
-                    strength = scene_rng.uniform(0.20, 0.42)
-                    band_center = scene_rng.uniform(0.32, 0.72)
-                    band_width = scene_rng.uniform(0.10, 0.20)
-                    band = np.exp(
-                        -0.5
-                        * ((normalized_height - band_center) / band_width) ** 2
+                    upper_weight = np.clip(
+                        (normalized_height - 0.30) / 0.10, 0.0, 1.0
                     )
-                    component = radial @ direction
-                    changed[:, :2] -= (
-                        strength * band * component
-                    )[:, None] * direction
-                    parameters.update(
-                        strength=strength,
-                        band_center=band_center,
-                        band_width=band_width,
+                    upper_weight = upper_weight * upper_weight * (
+                        3.0 - 2.0 * upper_weight
+                    )
+                    changed[:, :2] = (
+                        center_xy
+                        + radial
+                        * (1.0 - squeeze_amount * upper_weight)[:, None]
+                        + (band_shift_m * upper_weight)[:, None] * direction
                     )
                 elif damage_kind == "bend":
-                    amplitude = scene_rng.uniform(0.003, 0.008)
                     curve = normalized_height * normalized_height
                     changed[:, :2] += curve[:, None] * amplitude * direction
-                    bend_shift = amplitude * direction
-                    bend_degrees = math.degrees(math.atan2(2.0 * amplitude, height_local))
-                    parameters.update(
-                        strength=amplitude,
-                        mouth_shift_m=bend_shift.tolist(),
-                        mouth_tilt_deg=bend_degrees,
-                    )
                 else:
-                    strength = scene_rng.uniform(0.18, 0.38)
-                    band_center = scene_rng.uniform(0.28, 0.76)
-                    band_width = scene_rng.uniform(0.08, 0.17)
-                    band = np.exp(
-                        -0.5
-                        * ((normalized_height - band_center) / band_width) ** 2
+                    radial_norm = np.linalg.norm(radial, axis=1)
+                    radial_unit = np.zeros_like(radial)
+                    valid_radial = radial_norm > 1.0e-9
+                    radial_unit[valid_radial] = (
+                        radial[valid_radial] / radial_norm[valid_radial, None]
                     )
-                    toward_dent = np.maximum(0.0, radial @ direction / radius_local)
-                    indentation = strength * radius_local * band * toward_dent**2
-                    changed[:, :2] -= indentation[:, None] * direction
-                    parameters.update(
-                        strength=strength,
-                        band_center=band_center,
-                        band_width=band_width,
+                    point_angle = np.arctan2(radial[:, 1], radial[:, 0])
+                    angular_delta = np.arctan2(
+                        np.sin(point_angle - angle), np.cos(point_angle - angle)
                     )
+                    half_sector = math.radians(sector_degrees) / 2.0
+                    sector_weight = np.clip(
+                        1.0 - np.abs(angular_delta) / half_sector, 0.0, 1.0
+                    )
+                    mouth_weight = np.clip(
+                        (normalized_height - 0.78) / 0.16, 0.0, 1.0
+                    )
+                    polarity = 1.0 if rim_mode == "flare" else -1.0
+                    displacement = (
+                        polarity
+                        * rim_displacement
+                        * sector_weight
+                        * mouth_weight
+                    )
+                    changed[:, :2] += displacement[:, None] * radial_unit
 
                 mesh_record["mesh"].GetPointsAttr().Set(
                     [
@@ -456,42 +509,89 @@ def main() -> None:
                 )
             return parameters, bend_shift, bend_degrees, direction
 
-        def show_stacked_fallback(tube, scene_rng):
+        def show_stacked_fallback(tube, damage_kind, scene_rng, defect_boost):
             direction_angle = scene_rng.uniform(0.0, 2.0 * math.pi)
             direction = np.array(
                 [math.cos(direction_angle), math.sin(direction_angle)]
             )
-            mouth_shift = scene_rng.uniform(0.003, 0.007) * direction
-            squeeze_x = scene_rng.uniform(0.62, 0.88)
-            squeeze_y = scene_rng.uniform(0.72, 0.95)
+            mouth_shift = np.zeros(2, dtype=np.float64)
+            base_scale = 1.0
+            if damage_kind == "crush":
+                base_scale = max(
+                    0.25,
+                    1.0
+                    - (1.0 - scene_rng.uniform(0.45, 0.70)) * defect_boost,
+                )
+                band_shift = min(
+                    scene_rng.uniform(0.003, 0.006) * defect_boost, 0.010
+                ) * direction
+                mouth_shift = band_shift.copy()
+                strength = 1.0 - base_scale
+            elif damage_kind == "bend":
+                mouth_shift = min(
+                    scene_rng.uniform(0.006, 0.012) * defect_boost, 0.014
+                ) * direction
+                band_shift = np.zeros(2, dtype=np.float64)
+                strength = float(np.linalg.norm(mouth_shift))
+            else:
+                rim_displacement = min(
+                    scene_rng.uniform(0.002, 0.004) * defect_boost, 0.006
+                )
+                base_scale = 1.0 + scene_rng.choice((-1.0, 1.0)) * (
+                    rim_displacement / max(tube["fallback_segments"][0]["radius"], 1.0e-6)
+                )
+                band_shift = np.zeros(2, dtype=np.float64)
+                strength = rim_displacement
             for segment in tube["fallback_segments"]:
                 fraction = (segment["index"] + 0.5) / 3.0
+                upper = float(segment["index"] >= 1)
                 center = [
-                    float(segment["center_xy"][0] + mouth_shift[0] * fraction**2),
-                    float(segment["center_xy"][1] + mouth_shift[1] * fraction**2),
+                    float(
+                        segment["center_xy"][0]
+                        + mouth_shift[0] * fraction**2
+                        + band_shift[0] * upper
+                    ),
+                    float(
+                        segment["center_xy"][1]
+                        + mouth_shift[1] * fraction**2
+                        + band_shift[1] * upper
+                    ),
                     float(segment["base_z"] + segment["height"] * fraction),
                 ]
                 bend_degrees = math.degrees(
                     math.atan2(2.0 * np.linalg.norm(mouth_shift) * fraction, segment["height"])
                 )
                 bend_axis = (-direction[1], direction[0], 0.0)
+                segment_scale = 1.0
+                if damage_kind == "crush" and segment["index"] >= 1:
+                    segment_scale = base_scale
+                elif damage_kind == "split_rim" and segment["index"] == 2:
+                    segment_scale = base_scale
                 segment["op"].Set(
-                    scaling(squeeze_x, squeeze_y, 1.0)
+                    scaling(segment_scale, segment_scale, 1.0)
                     * rotation(bend_axis, bend_degrees)
                     * translation(center)
                 )
                 set_visible(segment["prim"], True)
             parameters = {
-                "kind": "stacked_bend",
-                "strength": float(np.linalg.norm(mouth_shift)),
-                "anisotropic_scale": [squeeze_x, squeeze_y],
+                "kind": damage_kind,
+                "strength": strength,
+                "boost": defect_boost,
+                "fallback": "stacked_segments",
             }
-            tilt = math.degrees(
-                math.atan2(2.0 * np.linalg.norm(mouth_shift), tube["maximum"][2] - tube["minimum"][2])
+            tilt = (
+                math.degrees(
+                    math.atan2(
+                        2.0 * np.linalg.norm(mouth_shift),
+                        tube["maximum"][2] - tube["minimum"][2],
+                    )
+                )
+                if damage_kind == "bend"
+                else 0.0
             )
             return parameters, mouth_shift, tilt, direction
 
-        def apply_slot(name, label, scene_rng):
+        def apply_slot(name, label, scene_rng, defect_boost):
             record = slot_info[name]
             tube = record["tube"]
             cap = record["cap"]
@@ -565,15 +665,15 @@ def main() -> None:
                 )
                 variation["crooked_tilt_deg"] = crooked_degrees
             elif label == "damaged_vial":
-                damage_kind = scene_rng.choice(("crush", "bend", "dent"))
+                damage_kind = scene_rng.choice(("crush", "bend", "split_rim"))
                 if tube["deformation_backend"] == "mesh_points":
                     damage, mouth_shift, mouth_tilt, bend_direction = deform_mesh_points(
-                        tube, damage_kind, scene_rng
+                        tube, damage_kind, scene_rng, defect_boost
                     )
                 else:
                     tube_visible = False
                     damage, mouth_shift, mouth_tilt, bend_direction = show_stacked_fallback(
-                        tube, scene_rng
+                        tube, damage_kind, scene_rng, defect_boost
                     )
                 if np.linalg.norm(mouth_shift) > 0.0:
                     bend_axis = (-bend_direction[1], bend_direction[0], 0.0)
@@ -626,11 +726,11 @@ def main() -> None:
 
         def randomize_light(light_record, intensity_range, scene_rng):
             factor = scene_rng.uniform(*intensity_range)
-            kelvin = scene_rng.uniform(3500.0, 6500.0)
+            kelvin = scene_rng.uniform(4200.0, 6200.0)
             color = [
                 1.0,
-                scene_rng.uniform(0.9, 1.0),
-                scene_rng.uniform(0.8, 1.0),
+                scene_rng.uniform(0.92, 1.0),
+                scene_rng.uniform(0.85, 1.0),
             ]
             jitter = [scene_rng.uniform(-0.045, 0.045) for _ in range(3)]
             prim = light_record["prim"]
@@ -687,7 +787,9 @@ def main() -> None:
             image_name = f"img_{image_index:04d}"
             image_seed = master_rng.randrange(0, 2**63)
             scene_rng = random.Random(image_seed)
-            fill_scene = sample_fill_scene(scene_rng)
+            fill_scene = sample_fill_scene(
+                scene_rng, class_balance=args.class_balance
+            )
             requested_shift_px = [
                 scene_rng.uniform(-20.0, 20.0),
                 scene_rng.uniform(-20.0, 20.0),
@@ -726,12 +828,15 @@ def main() -> None:
             variations = {}
             for slot_name in SLOT_NAMES:
                 variations[slot_name] = apply_slot(
-                    slot_name, fill_scene.labels[slot_name], scene_rng
+                    slot_name,
+                    fill_scene.labels[slot_name],
+                    scene_rng,
+                    args.defect_boost,
                 )
 
             lights = {
-                "key": randomize_light(key_record, (0.4, 1.8), scene_rng),
-                "fill": randomize_light(fill_record, (0.3, 2.5), scene_rng),
+                "key": randomize_light(key_record, (0.7, 1.8), scene_rng),
+                "fill": randomize_light(fill_record, (0.7, 2.5), scene_rng),
             }
             for _ in range(3):
                 kit.update()
@@ -780,6 +885,10 @@ def main() -> None:
             )
             labels_document = {
                 "image_size": [width, height],
+                "generation": {
+                    "defect_boost": args.defect_boost,
+                    "class_balance": args.class_balance,
+                },
                 "camera": {
                     "model": "opencv_fisheye",
                     "focal_px": focal,

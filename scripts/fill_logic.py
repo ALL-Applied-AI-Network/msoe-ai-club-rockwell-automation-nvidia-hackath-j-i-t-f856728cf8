@@ -34,12 +34,16 @@ def fill_count_weights() -> tuple[float, ...]:
     return tuple(weights)
 
 
-def sample_fill_scene(rng: random.Random) -> FillScene:
+def sample_fill_scene(
+    rng: random.Random, *, class_balance: bool = False
+) -> FillScene:
     """Sample one fill-prefix scene without importing Isaac Sim."""
     expected_through = rng.choices(range(31), weights=fill_count_weights(), k=1)[0]
+    if class_balance:
+        expected_through = max(3, expected_through)
 
     missed_position = None
-    if expected_through >= 2 and rng.random() < 0.03:
+    if not class_balance and expected_through >= 2 and rng.random() < 0.03:
         missed_index = rng.randint(1, expected_through - 1)
         missed_position = f"G{missed_index:02d}"
 
@@ -52,6 +56,13 @@ def sample_fill_scene(rng: random.Random) -> FillScene:
             labels[slot] = rng.choices(
                 OCCUPIED_CLASSES, weights=OCCUPIED_WEIGHTS, k=1
             )[0]
+
+    if class_balance:
+        forced_slots = rng.sample(list(SLOT_NAMES[:expected_through]), 3)
+        forced_classes = ["damaged_vial", "crooked_cap", "missing_cap"]
+        rng.shuffle(forced_classes)
+        for slot, label in zip(forced_slots, forced_classes, strict=True):
+            labels[slot] = label
 
     return FillScene(
         labels=labels,
