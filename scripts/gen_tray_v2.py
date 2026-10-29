@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import traceback
@@ -42,6 +43,23 @@ MAX_DAMAGE_ATTEMPTS = 10
 MIN_CRUSH_SHIFT_M = 0.003
 MIN_BEND_SHIFT_M = 0.006
 MIN_LEAN_DEGREES = 10.0
+PANEL_BOUNDS_XY = (-0.920, -0.209, -2.019, -0.038)
+PANEL_SURFACE_Z = 1.016
+PANEL_MATERIAL_PATH = "/TrayInspection/_materials/tw_table_paint"
+BACKDROP_PRIM_PATH = "/TrayInspection/GeneratorBackdropExtension"
+BACKDROP_OVERLAP_M = 0.001
+BACKDROP_MARGIN_M = 0.020
+BACKDROP_THICKNESS_M = 0.005
+BACKDROP_SURFACE_DROP_M = 0.0005
+LIGHT_PROFILES = ("legacy", "real")
+FLOOR_PRIM_PATH = "/TrayInspection/GeneratorFloorBackdrop"
+FLOOR_MATERIAL_PATH = "/TrayInspection/_materials/GeneratorFloorMaterial"
+FLOOR_MARGIN_M = 0.300
+FLOOR_CLEARANCE_M = 0.005
+FLOOR_THICKNESS_M = 0.005
+DEFAULT_FLOOR_ALBEDO = (0.36, 0.31, 0.22)
+DEFAULT_FLOOR_EMISSIVE = (0.15, 0.115, 0.07)
+FLOOR_JITTER_SEED_OFFSET = 0x464C4F4F52
 
 
 def labeler_grid_center(grid, position: int) -> tuple[float, float]:
@@ -111,6 +129,456 @@ def translated_crop_centers(
     return centers
 
 
+def rectangle_perimeter_pixels(
+    x0: float, y0: float, x1: float, y1: float, samples_per_edge: int
+):
+    """Return evenly sampled pixels around a closed axis-aligned rectangle."""
+    import numpy as np
+
+    if samples_per_edge < 2:
+        raise ValueError("samples_per_edge must be at least 2")
+    horizontal = np.linspace(float(x0), float(x1), samples_per_edge)
+    vertical = np.linspace(float(y0), float(y1), samples_per_edge)
+    return np.vstack(
+        (
+            np.column_stack((horizontal, np.full(samples_per_edge, float(y0)))),
+            np.column_stack((horizontal, np.full(samples_per_edge, float(y1)))),
+            np.column_stack((np.full(samples_per_edge, float(x0)), vertical)),
+            np.column_stack((np.full(samples_per_edge, float(x1)), vertical)),
+        )
+    )
+
+
+def fisheye_pixels_on_world_plane(camera: dict, pixels, plane_z: float):
+    """Intersect fitted-camera rays for fisheye pixels with a world-Z plane."""
+    import numpy as np
+
+    focal = float(camera["focal_px"])
+    normalized = fisheye_pixels_to_pinhole_normalized(
+        np.asarray(pixels, dtype=np.float64),
+        focal,
+        float(camera["k1"]),
+        float(camera["k2"]),
+    )
+    rotation_world_to_cv = np.asarray(camera["R_world_to_cv"], dtype=np.float64)
+    camera_position = np.asarray(camera["position_m"], dtype=np.float64)
+    camera_rays = np.column_stack(
+        (normalized, np.ones(normalized.shape[0], dtype=np.float64))
+    )
+    world_rays = (rotation_world_to_cv.T @ camera_rays.T).T
+    if np.any(np.abs(world_rays[:, 2]) < 1.0e-12):
+        raise ValueError("One or more camera rays are parallel to the requested plane")
+    distances = (float(plane_z) - camera_position[2]) / world_rays[:, 2]
+    if np.any(distances <= 0.0):
+        raise ValueError("The requested plane lies behind one or more camera rays")
+    return camera_position + distances[:, None] * world_rays
+
+
+def compute_labeler_plane_coverage(
+    camera: dict,
+    labeler_geometry: dict,
+    plane_z: float,
+    *,
+    translation_limit_px: int = 15,
+    frame_samples_per_edge: int = 2049,
+    crop_samples_per_edge: int = 33,
+) -> dict[str, object]:
+    """Project the image frame and every jittered labeler crop onto a Z plane."""
+    import numpy as np
+
+    width, height = (int(value) for value in camera["image_size"])
+    frame_pixels = rectangle_perimeter_pixels(
+        0.0, 0.0, width - 1.0, height - 1.0, frame_samples_per_edge
+    )
+    frame_world = fisheye_pixels_on_world_plane(camera, frame_pixels, plane_z)
+    image_midpoints = fisheye_pixels_on_world_plane(
+        camera,
+        np.asarray([[0.0, height / 2.0], [width - 1.0, height / 2.0]]),
+        plane_z,
+    )
+
+    slot_bounds = {}
+    all_crop_points = []
+    jitter_values = (-int(translation_limit_px), int(translation_limit_px))
+    for slot_name in ALL_SLOT_NAMES:
+        fixture = slot_name[0]
+        center = labeler_geometry["fixtures"][fixture]["centers"][slot_name]
+        offsets = labeler_geometry["fixtures"][fixture]["crop_offsets"]
+        slot_points = []
+        for dx in jitter_values:
+            for dy in jitter_values:
+                pixels = rectangle_perimeter_pixels(
+                    center[0] + dx + offsets[0],
+                    center[1] + dy + offsets[1],
+                    center[0] + dx + offsets[2],
+                    center[1] + dy + offsets[3],
+                    crop_samples_per_edge,
+                )
+                slot_points.append(
+                    fisheye_pixels_on_world_plane(camera, pixels, plane_z)
+                )
+        combined = np.vstack(slot_points)
+        all_crop_points.append(combined)
+        slot_bounds[slot_name] = {
+            "minimum": combined.min(axis=0),
+            "maximum": combined.max(axis=0),
+        }
+
+    all_crops = np.vstack(all_crop_points)
+    return {
+        "plane_z": float(plane_z),
+        "image_left_world": image_midpoints[0],
+        "image_right_world": image_midpoints[1],
+        "frame_minimum": frame_world.min(axis=0),
+        "frame_maximum": frame_world.max(axis=0),
+        "crops_minimum": all_crops.min(axis=0),
+        "crops_maximum": all_crops.max(axis=0),
+        "slots": slot_bounds,
+    }
+
+
+def panel_crop_overruns(
+    coverage: dict[str, object],
+    panel_bounds_xy: tuple[float, float, float, float] = PANEL_BOUNDS_XY,
+) -> dict[str, list[str]]:
+    """List labeler crops that project beyond each edge of the white panel."""
+    panel_x_min, panel_x_max, panel_y_min, panel_y_max = panel_bounds_xy
+    overruns = {"low_x": [], "high_x": [], "low_y": [], "high_y": []}
+    for slot_name, bounds in coverage["slots"].items():
+        minimum = bounds["minimum"]
+        maximum = bounds["maximum"]
+        if minimum[0] < panel_x_min:
+            overruns["low_x"].append(slot_name)
+        if maximum[0] > panel_x_max:
+            overruns["high_x"].append(slot_name)
+        if minimum[1] < panel_y_min:
+            overruns["low_y"].append(slot_name)
+        if maximum[1] > panel_y_max:
+            overruns["high_y"].append(slot_name)
+    return overruns
+
+
+def high_x_backdrop_spec(
+    coverage: dict[str, object],
+    panel_bounds_xy: tuple[float, float, float, float] = PANEL_BOUNDS_XY,
+    *,
+    overlap_m: float = BACKDROP_OVERLAP_M,
+    safety_margin_m: float = BACKDROP_MARGIN_M,
+    thickness_m: float = BACKDROP_THICKNESS_M,
+    surface_drop_m: float = BACKDROP_SURFACE_DROP_M,
+) -> dict[str, object]:
+    """Size one slab for crops that extend beyond the panel's high-X edge."""
+    panel_x_max = float(panel_bounds_xy[1])
+    offending = [
+        (slot_name, bounds)
+        for slot_name, bounds in coverage["slots"].items()
+        if float(bounds["maximum"][0]) > panel_x_max
+    ]
+    if not offending:
+        raise ValueError("No labeler crop extends beyond the panel's high-X edge")
+    x_min = panel_x_max - float(overlap_m)
+    x_max = max(float(bounds["maximum"][0]) for _, bounds in offending) + float(
+        safety_margin_m
+    )
+    y_min = min(float(bounds["minimum"][1]) for _, bounds in offending) - float(
+        safety_margin_m
+    )
+    y_max = max(float(bounds["maximum"][1]) for _, bounds in offending) + float(
+        safety_margin_m
+    )
+    top_z = PANEL_SURFACE_Z - float(surface_drop_m)
+    bottom_z = top_z - float(thickness_m)
+    return {
+        "prim_path": BACKDROP_PRIM_PATH,
+        "material_path": PANEL_MATERIAL_PATH,
+        "offending_slots": [slot_name for slot_name, _ in offending],
+        "minimum": [x_min, y_min, bottom_z],
+        "maximum": [x_max, y_max, top_z],
+        "center": [
+            (x_min + x_max) / 2.0,
+            (y_min + y_max) / 2.0,
+            (bottom_z + top_z) / 2.0,
+        ],
+        "size": [x_max - x_min, y_max - y_min, top_z - bottom_z],
+    }
+
+
+def project_slab_corners_to_fisheye(camera: dict, world_corners) -> dict[str, object]:
+    """Project exactly eight slab corners with the fitted fisheye camera."""
+    import numpy as np
+
+    corners = np.asarray(world_corners, dtype=np.float64)
+    if corners.shape != (8, 3):
+        raise ValueError(f"world_corners must have shape (8, 3), got {corners.shape}")
+    pixels = project_world(
+        corners,
+        np.asarray(camera["R_world_to_cv"], dtype=np.float64),
+        np.asarray(camera["position_m"], dtype=np.float64),
+        float(camera["focal_px"]),
+        float(camera["k1"]),
+        float(camera["k2"]),
+    )
+    return {
+        "world_minimum": corners.min(axis=0),
+        "world_maximum": corners.max(axis=0),
+        "pixels": pixels,
+        "pixel_minimum": pixels.min(axis=0),
+        "pixel_maximum": pixels.max(axis=0),
+    }
+
+
+def local_matrix_for_world_box(parent_world_matrix, center, size):
+    """Return a row-vector USD local matrix for an axis-aligned world box."""
+    import numpy as np
+
+    parent = np.asarray(parent_world_matrix, dtype=np.float64)
+    center_values = np.asarray(center, dtype=np.float64)
+    size_values = np.asarray(size, dtype=np.float64)
+    if parent.shape != (4, 4):
+        raise ValueError(f"parent_world_matrix must have shape (4, 4), got {parent.shape}")
+    if center_values.shape != (3,) or size_values.shape != (3,):
+        raise ValueError("center and size must each contain exactly three values")
+    if np.any(size_values <= 0.0):
+        raise ValueError("world box sizes must be positive")
+    desired_world = np.eye(4, dtype=np.float64)
+    desired_world[0, 0] = size_values[0]
+    desired_world[1, 1] = size_values[1]
+    desired_world[2, 2] = size_values[2]
+    desired_world[3, :3] = center_values
+    return desired_world @ np.linalg.inv(parent)
+
+
+def default_light_scale(profile: str) -> float:
+    """Return the profile-specific default intensity multiplier."""
+    if profile == "legacy":
+        return 1.0
+    if profile == "real":
+        return 1.35
+    raise ValueError(f"Unknown light profile: {profile!r}")
+
+
+def sample_light_settings(
+    scene_rng: random.Random,
+    intensity_range: tuple[float, float],
+    profile: str,
+    light_scale: float,
+) -> dict[str, object]:
+    """Sample one light while preserving the legacy RNG sequence exactly."""
+    if profile not in LIGHT_PROFILES:
+        raise ValueError(f"Unknown light profile: {profile!r}")
+    if light_scale <= 0.0:
+        raise ValueError("light_scale must be positive")
+    factor = scene_rng.uniform(*intensity_range)
+    if profile == "legacy":
+        kelvin = scene_rng.uniform(4200.0, 6200.0)
+        color = [
+            1.0,
+            scene_rng.uniform(0.92, 1.0),
+            scene_rng.uniform(0.85, 1.0),
+        ]
+    else:
+        kelvin = scene_rng.uniform(5200.0, 6500.0)
+        color = [1.0, 1.0, 1.0]
+    jitter = [scene_rng.uniform(-0.045, 0.045) for _ in range(3)]
+    return {
+        "profile": profile,
+        "intensity_factor": factor,
+        "intensity_scale": float(light_scale),
+        "intensity_multiplier": factor * float(light_scale),
+        "color_temperature_k": kelvin,
+        "color_rgb": color,
+        "position_jitter_m": jitter,
+    }
+
+
+def parse_rgb_triplet(value: str) -> tuple[float, float, float]:
+    """Parse a comma-separated linear RGB triplet for argparse."""
+    try:
+        values = tuple(float(component.strip()) for component in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("RGB values must be numbers") from exc
+    if len(values) != 3 or any(component < 0.0 or component > 1.0 for component in values):
+        raise argparse.ArgumentTypeError(
+            "RGB must contain exactly three comma-separated values from 0 to 1"
+        )
+    return values
+
+
+def parse_nonnegative_rgb_triplet(value: str) -> tuple[float, float, float]:
+    """Parse three comma-separated non-negative RGB values for argparse."""
+    try:
+        values = tuple(float(component.strip()) for component in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("RGB values must be numbers") from exc
+    if len(values) != 3 or any(component < 0.0 for component in values):
+        raise argparse.ArgumentTypeError(
+            "RGB must contain exactly three comma-separated non-negative values"
+        )
+    return values
+
+
+def floor_material_inputs(albedo, emissive) -> dict[str, object]:
+    """Describe authored floor shader inputs, omitting zero emissive by default."""
+    albedo_values = tuple(float(value) for value in albedo)
+    emissive_values = tuple(float(value) for value in emissive)
+    if len(albedo_values) != 3 or len(emissive_values) != 3:
+        raise ValueError("floor albedo and emissive must each contain three values")
+    if any(value < 0.0 for value in emissive_values):
+        raise ValueError("floor emissive values must be non-negative")
+    inputs = {
+        "diffuseColor": albedo_values,
+        "roughness": 0.9,
+        "metallic": 0.0,
+    }
+    if any(value > 0.0 for value in emissive_values):
+        inputs["emissiveColor"] = emissive_values
+    return inputs
+
+
+def sample_floor_emissive(
+    base_emissive,
+    jitter_fraction: float,
+    seed: int,
+    image_index: int,
+) -> dict[str, object]:
+    """Sample floor emission from an RNG isolated from all scene randomness."""
+    base = tuple(float(value) for value in base_emissive)
+    if len(base) != 3 or any(value < 0.0 for value in base):
+        raise ValueError("base_emissive must contain three non-negative values")
+    fraction = float(jitter_fraction)
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("jitter_fraction must be from 0 to 1")
+    if image_index < 0:
+        raise ValueError("image_index must be non-negative")
+    if fraction == 0.0:
+        brightness_factor = 1.0
+        red_factor = 1.0
+        blue_factor = 1.0
+    else:
+        floor_rng = random.Random(int(seed) + FLOOR_JITTER_SEED_OFFSET + image_index)
+        brightness_factor = floor_rng.uniform(1.0 - fraction, 1.0 + fraction)
+        red_factor = floor_rng.uniform(0.95, 1.05)
+        blue_factor = floor_rng.uniform(0.95, 1.05)
+    emissive = [
+        base[0] * brightness_factor * red_factor,
+        base[1] * brightness_factor,
+        base[2] * brightness_factor * blue_factor,
+    ]
+    return {
+        "base_emissive": list(base),
+        "emissive": emissive,
+        "brightness_factor": brightness_factor,
+        "red_factor": red_factor,
+        "blue_factor": blue_factor,
+        "jitter_fraction": fraction,
+        "seed": int(seed) + FLOOR_JITTER_SEED_OFFSET + image_index,
+        "image_index": image_index,
+    }
+
+
+def floor_box_spec(
+    camera: dict,
+    labeler_geometry: dict,
+    station_minimum_z: float,
+    *,
+    margin_m: float = FLOOR_MARGIN_M,
+    clearance_m: float = FLOOR_CLEARANCE_M,
+    thickness_m: float = FLOOR_THICKNESS_M,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Size a floor below station geometry from the fisheye frame footprint."""
+    top_z = float(station_minimum_z) - float(clearance_m)
+    coverage = compute_labeler_plane_coverage(camera, labeler_geometry, top_z)
+    x_min = float(coverage["frame_minimum"][0]) - float(margin_m)
+    x_max = float(coverage["frame_maximum"][0]) + float(margin_m)
+    y_min = float(coverage["frame_minimum"][1]) - float(margin_m)
+    y_max = float(coverage["frame_maximum"][1]) + float(margin_m)
+    bottom_z = top_z - float(thickness_m)
+    spec = {
+        "prim_path": FLOOR_PRIM_PATH,
+        "material_path": FLOOR_MATERIAL_PATH,
+        "minimum": [x_min, y_min, bottom_z],
+        "maximum": [x_max, y_max, top_z],
+        "center": [
+            (x_min + x_max) / 2.0,
+            (y_min + y_max) / 2.0,
+            (bottom_z + top_z) / 2.0,
+        ],
+        "size": [x_max - x_min, y_max - y_min, top_z - bottom_z],
+        "station_minimum_z": float(station_minimum_z),
+        "clearance_m": float(clearance_m),
+        "margin_m": float(margin_m),
+    }
+    return spec, coverage
+
+
+def approximate_uncovered_crop_corners(
+    camera: dict,
+    labeler_geometry: dict,
+    panel_bounds_xy: tuple[float, float, float, float],
+    slab_spec: dict[str, object] | None,
+    floor_specification: dict[str, object] | None,
+    *,
+    translation_limit_px: int = 15,
+    authored_pixel_boxes: tuple[tuple[object, object], ...] = (),
+) -> list[str]:
+    """Approximate crop coverage by known planar extents and projected AABBs."""
+    import numpy as np
+
+    panel_x_min, panel_x_max, panel_y_min, panel_y_max = panel_bounds_xy
+    uncovered = []
+    for slot_name in ALL_SLOT_NAMES:
+        fixture = slot_name[0]
+        center = labeler_geometry["fixtures"][fixture]["centers"][slot_name]
+        offsets = labeler_geometry["fixtures"][fixture]["crop_offsets"]
+        pixels = []
+        for dx in (-translation_limit_px, translation_limit_px):
+            for dy in (-translation_limit_px, translation_limit_px):
+                x0 = center[0] + dx + offsets[0]
+                x1 = center[0] + dx + offsets[2]
+                y0 = center[1] + dy + offsets[1]
+                y1 = center[1] + dy + offsets[3]
+                pixels.extend(((x0, y0), (x0, y1), (x1, y0), (x1, y1)))
+        pixel_array = np.asarray(pixels, dtype=np.float64)
+        panel_points = fisheye_pixels_on_world_plane(
+            camera, pixel_array, PANEL_SURFACE_Z
+        )
+        covered = (
+            (panel_points[:, 0] >= panel_x_min)
+            & (panel_points[:, 0] <= panel_x_max)
+            & (panel_points[:, 1] >= panel_y_min)
+            & (panel_points[:, 1] <= panel_y_max)
+        )
+        if slab_spec is not None:
+            slab_points = fisheye_pixels_on_world_plane(
+                camera, pixel_array, float(slab_spec["maximum"][2])
+            )
+            covered |= (
+                (slab_points[:, 0] >= float(slab_spec["minimum"][0]))
+                & (slab_points[:, 0] <= float(slab_spec["maximum"][0]))
+                & (slab_points[:, 1] >= float(slab_spec["minimum"][1]))
+                & (slab_points[:, 1] <= float(slab_spec["maximum"][1]))
+            )
+        if floor_specification is not None:
+            floor_points = fisheye_pixels_on_world_plane(
+                camera, pixel_array, float(floor_specification["maximum"][2])
+            )
+            covered |= (
+                (floor_points[:, 0] >= float(floor_specification["minimum"][0]))
+                & (floor_points[:, 0] <= float(floor_specification["maximum"][0]))
+                & (floor_points[:, 1] >= float(floor_specification["minimum"][1]))
+                & (floor_points[:, 1] <= float(floor_specification["maximum"][1]))
+            )
+        for pixel_minimum, pixel_maximum in authored_pixel_boxes:
+            minimum = np.asarray(pixel_minimum, dtype=np.float64)
+            maximum = np.asarray(pixel_maximum, dtype=np.float64)
+            covered |= np.all(pixel_array >= minimum, axis=1) & np.all(
+                pixel_array <= maximum, axis=1
+            )
+        if not bool(np.all(covered)):
+            uncovered.append(slot_name)
+    return uncovered
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=100)
@@ -154,6 +622,54 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Scale pinhole render resolution while preserving its full FOV.",
+    )
+    parser.add_argument(
+        "--no-backdrop",
+        action="store_true",
+        help="Disable the session-layer white-panel backdrop extension.",
+    )
+    parser.add_argument(
+        "--backdrop-debug",
+        action="store_true",
+        help="Bind the backdrop to a bright magenta emissive debug material.",
+    )
+    parser.add_argument(
+        "--light-profile",
+        choices=LIGHT_PROFILES,
+        default="real",
+        help="Lighting color/temperature profile (default: real).",
+    )
+    parser.add_argument(
+        "--light-scale",
+        type=float,
+        default=None,
+        help="Base light intensity multiplier (default: 1.0 legacy, 1.35 real).",
+    )
+    parser.add_argument(
+        "--no-floor",
+        action="store_true",
+        help="Disable the session-layer floor background.",
+    )
+    parser.add_argument(
+        "--floor-albedo",
+        type=parse_rgb_triplet,
+        default=DEFAULT_FLOOR_ALBEDO,
+        metavar="R,G,B",
+        help="Linear RGB floor albedo (default: 0.36,0.31,0.22).",
+    )
+    parser.add_argument(
+        "--floor-emissive",
+        type=parse_nonnegative_rgb_triplet,
+        default=DEFAULT_FLOOR_EMISSIVE,
+        metavar="R,G,B",
+        help="Non-negative RGB floor emission (default: 0.15,0.115,0.07).",
+    )
+    parser.add_argument(
+        "--floor-brightness-jitter",
+        type=float,
+        default=0.25,
+        metavar="FRACTION",
+        help="Per-image floor brightness variation; zero disables (default: 0.25).",
     )
     return parser.parse_args()
 
@@ -246,6 +762,12 @@ def main() -> None:
             raise ValueError("--defect-boost must be positive")
         if args.damage_weight < 0.0:
             raise ValueError("--damage-weight must be non-negative")
+        if args.light_scale is None:
+            args.light_scale = default_light_scale(args.light_profile)
+        if args.light_scale <= 0.0:
+            raise ValueError("--light-scale must be positive")
+        if not 0.0 <= args.floor_brightness_jitter <= 1.0:
+            raise ValueError("--floor-brightness-jitter must be from 0 to 1")
         if Path(args.prefix).name != args.prefix or any(
             separator in args.prefix for separator in ("/", "\\")
         ):
@@ -272,6 +794,27 @@ def main() -> None:
         labeler_geometry = load_labeler_geometry(LABELER_CALIBRATION_PATH)
         rotation_world_to_cv = np.asarray(camera["R_world_to_cv"], dtype=np.float64)
         camera_position = np.asarray(camera["position_m"], dtype=np.float64)
+        backdrop_coverage = compute_labeler_plane_coverage(
+            camera, labeler_geometry, PANEL_SURFACE_Z
+        )
+        backdrop_overruns = panel_crop_overruns(backdrop_coverage)
+        backdrop_spec = high_x_backdrop_spec(backdrop_coverage)
+        image_left_side = (
+            "+X"
+            if backdrop_coverage["image_left_world"][0]
+            > backdrop_coverage["image_right_world"][0]
+            else "-X"
+        )
+        print(
+            "panel coverage: "
+            f"image-left={image_left_side}, "
+            f"frame X=[{backdrop_coverage['frame_minimum'][0]:.6f}, "
+            f"{backdrop_coverage['frame_maximum'][0]:.6f}], "
+            f"crops X=[{backdrop_coverage['crops_minimum'][0]:.6f}, "
+            f"{backdrop_coverage['crops_maximum'][0]:.6f}], "
+            f"overruns={backdrop_overruns}",
+            flush=True,
+        )
         render_width, render_height, render_focal, map_x, map_y = build_remap(
             width, height, focal, k1, k2, theta_max, args.width_scale
         )
@@ -292,7 +835,7 @@ def main() -> None:
         enable_extension("omni.replicator.core")
         import omni.replicator.core as rep
         import omni.usd
-        from pxr import Gf, Usd, UsdGeom, UsdLux
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade
 
         output_images = args.out / "images"
         output_crops = args.out / "crops"
@@ -374,6 +917,338 @@ def main() -> None:
         bbox_cache = UsdGeom.BBoxCache(
             time_code, [UsdGeom.Tokens.default_, UsdGeom.Tokens.render]
         )
+
+        def create_backdrop_slab(spec, debug_material=False):
+            """Create and material-bind one collision-checked session-layer slab."""
+            if stage.GetEditTarget().GetLayer() != stage.GetSessionLayer():
+                raise RuntimeError("Backdrop must be authored in the USD session layer")
+            slab_minimum = np.asarray(spec["minimum"], dtype=np.float64)
+            slab_maximum = np.asarray(spec["maximum"], dtype=np.float64)
+            clearance = 0.00025
+            slot_part = re.compile(r"^[GS]\d{2}_(?:cap|tube)$", re.IGNORECASE)
+            collisions = []
+            for prim in stage.Traverse():
+                name = prim.GetName()
+                lower_name = name.lower()
+                if not (
+                    slot_part.fullmatch(name)
+                    or lower_name.startswith("tray_")
+                    or lower_name.startswith("post")
+                ):
+                    continue
+                try:
+                    aligned = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
+                    obstacle_minimum = np.asarray(aligned.GetMin(), dtype=np.float64)
+                    obstacle_maximum = np.asarray(aligned.GetMax(), dtype=np.float64)
+                except Exception:
+                    continue
+                if not np.all(np.isfinite(obstacle_minimum)) or not np.all(
+                    np.isfinite(obstacle_maximum)
+                ):
+                    continue
+                overlaps = np.all(
+                    slab_minimum - clearance < obstacle_maximum
+                ) and np.all(slab_maximum + clearance > obstacle_minimum)
+                if overlaps:
+                    collisions.append(str(prim.GetPath()))
+            if collisions:
+                raise RuntimeError(
+                    "Backdrop slab would touch vial/tray/post geometry: "
+                    + ", ".join(collisions[:20])
+                )
+
+            material_path = spec["material_path"]
+            if debug_material:
+                material_path = (
+                    "/TrayInspection/_materials/GeneratorBackdropDebugMagenta"
+                )
+                material = UsdShade.Material.Define(stage, material_path)
+                shader = UsdShade.Shader.Define(
+                    stage, f"{material_path}/PreviewSurface"
+                )
+                shader.CreateIdAttr("UsdPreviewSurface")
+                shader.CreateInput(
+                    "diffuseColor", Sdf.ValueTypeNames.Color3f
+                ).Set(Gf.Vec3f(1.0, 0.0, 1.0))
+                shader.CreateInput(
+                    "emissiveColor", Sdf.ValueTypeNames.Color3f
+                ).Set(Gf.Vec3f(4.0, 0.0, 4.0))
+                shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(1.0)
+                shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.25)
+                material.CreateSurfaceOutput().ConnectToSource(
+                    shader.ConnectableAPI(), "surface"
+                )
+            else:
+                material = UsdShade.Material.Get(stage, material_path)
+            if not material or not material.GetPrim().IsValid():
+                raise RuntimeError(
+                    f"Backdrop material does not exist: {material_path}"
+                )
+            backdrop = UsdGeom.Cube.Define(stage, spec["prim_path"])
+            backdrop.CreateSizeAttr(1.0)
+            backdrop.CreatePurposeAttr(UsdGeom.Tokens.render)
+            xform = UsdGeom.Xformable(backdrop.GetPrim())
+            parent_world = UsdGeom.Xformable(
+                backdrop.GetPrim().GetParent()
+            ).ComputeLocalToWorldTransform(time_code)
+            parent_world_values = np.asarray(
+                [
+                    [float(parent_world[row][column]) for column in range(4)]
+                    for row in range(4)
+                ],
+                dtype=np.float64,
+            )
+            local_matrix_values = local_matrix_for_world_box(
+                parent_world_values, spec["center"], spec["size"]
+            )
+            xform.ClearXformOpOrder()
+            transform_op = xform.AddTransformOp()
+            transform_op.Set(
+                Gf.Matrix4d(
+                    *[float(value) for value in local_matrix_values.reshape(-1)]
+                )
+            )
+            binding_strength = (
+                UsdShade.Tokens.strongerThanDescendants
+                if debug_material
+                else UsdShade.Tokens.weakerThanDescendants
+            )
+            UsdShade.MaterialBindingAPI.Apply(backdrop.GetPrim()).Bind(
+                material, binding_strength
+            )
+
+            world_matrix = xform.ComputeLocalToWorldTransform(time_code)
+            local_corners = [
+                Gf.Vec3d(x_value, y_value, z_value)
+                for x_value in (-0.5, 0.5)
+                for y_value in (-0.5, 0.5)
+                for z_value in (-0.5, 0.5)
+            ]
+            world_corners = np.asarray(
+                [world_matrix.Transform(corner) for corner in local_corners],
+                dtype=np.float64,
+            )
+            footprint = project_slab_corners_to_fisheye(camera, world_corners)
+            verification_cache = UsdGeom.BBoxCache(
+                time_code,
+                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                useExtentsHint=False,
+            )
+            actual_box = verification_cache.ComputeWorldBound(
+                backdrop.GetPrim()
+            ).ComputeAlignedBox()
+            actual_minimum = np.asarray(actual_box.GetMin(), dtype=np.float64)
+            actual_maximum = np.asarray(actual_box.GetMax(), dtype=np.float64)
+            intended_minimum = np.asarray(spec["minimum"], dtype=np.float64)
+            intended_maximum = np.asarray(spec["maximum"], dtype=np.float64)
+            maximum_error = float(
+                max(
+                    np.max(np.abs(actual_minimum - intended_minimum)),
+                    np.max(np.abs(actual_maximum - intended_maximum)),
+                )
+            )
+            if maximum_error > 0.001:
+                raise RuntimeError(
+                    "Backdrop composed world bounds do not match the intended box: "
+                    f"intendedMin={intended_minimum.tolist()} "
+                    f"intendedMax={intended_maximum.tolist()} "
+                    f"actualMin={actual_minimum.tolist()} "
+                    f"actualMax={actual_maximum.tolist()} "
+                    f"maxErrorM={maximum_error:.9f}"
+                )
+            runtime = {
+                "world_minimum": actual_minimum.tolist(),
+                "world_maximum": actual_maximum.tolist(),
+                "world_bounds_max_error_m": maximum_error,
+                "pixel_minimum": footprint["pixel_minimum"].tolist(),
+                "pixel_maximum": footprint["pixel_maximum"].tolist(),
+                "material_path": material_path,
+                "binding_strength": str(binding_strength),
+                "active": backdrop.GetPrim().IsActive(),
+                "visibility": str(
+                    UsdGeom.Imageable(backdrop.GetPrim()).ComputeVisibility(time_code)
+                ),
+                "purpose": str(backdrop.GetPurposeAttr().Get(time_code)),
+            }
+            print(
+                f"created backdrop {spec['prim_path']} center={spec['center']} "
+                f"size={spec['size']} material={material_path} "
+                f"bindingStrength={binding_strength} active={runtime['active']} "
+                f"visibility={runtime['visibility']} purpose={runtime['purpose']} "
+                f"actualWorldMin={runtime['world_minimum']} "
+                f"actualWorldMax={runtime['world_maximum']} "
+                f"worldBoundsMaxErrorM={runtime['world_bounds_max_error_m']:.9f} "
+                f"pixelBBox=[{runtime['pixel_minimum']}, {runtime['pixel_maximum']}]",
+                flush=True,
+            )
+            return runtime
+
+        backdrop_runtime = None
+        if not args.no_backdrop:
+            backdrop_runtime = create_backdrop_slab(
+                backdrop_spec, debug_material=args.backdrop_debug
+            )
+
+        def create_floor_box(spec, albedo, emissive):
+            """Create a collision-checked session-layer floor in world coordinates."""
+            if stage.GetEditTarget().GetLayer() != stage.GetSessionLayer():
+                raise RuntimeError("Floor must be authored in the USD session layer")
+            floor_minimum = np.asarray(spec["minimum"], dtype=np.float64)
+            floor_maximum = np.asarray(spec["maximum"], dtype=np.float64)
+            collision_cache = UsdGeom.BBoxCache(
+                time_code,
+                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                useExtentsHint=False,
+            )
+            slot_part = re.compile(r"^[GS]\d{2}_(?:cap|tube)$", re.IGNORECASE)
+            collisions = []
+            for prim in stage.Traverse():
+                name = prim.GetName()
+                lower_name = name.lower()
+                if not (
+                    slot_part.fullmatch(name)
+                    or lower_name.startswith("tray_")
+                    or lower_name.startswith("post")
+                    or "steel" in lower_name
+                ):
+                    continue
+                try:
+                    aligned = collision_cache.ComputeWorldBound(
+                        prim
+                    ).ComputeAlignedBox()
+                    obstacle_minimum = np.asarray(aligned.GetMin(), dtype=np.float64)
+                    obstacle_maximum = np.asarray(aligned.GetMax(), dtype=np.float64)
+                except Exception:
+                    continue
+                if not np.all(np.isfinite(obstacle_minimum)) or not np.all(
+                    np.isfinite(obstacle_maximum)
+                ):
+                    continue
+                overlaps = np.all(floor_minimum < obstacle_maximum) and np.all(
+                    floor_maximum > obstacle_minimum
+                )
+                if overlaps:
+                    collisions.append(str(prim.GetPath()))
+            if collisions:
+                raise RuntimeError(
+                    "Floor would intersect vial/tray/post/steel geometry: "
+                    + ", ".join(collisions[:20])
+                )
+
+            material = UsdShade.Material.Define(stage, spec["material_path"])
+            shader = UsdShade.Shader.Define(
+                stage, f"{spec['material_path']}/PreviewSurface"
+            )
+            shader.CreateIdAttr("UsdPreviewSurface")
+            material_settings = floor_material_inputs(albedo, emissive)
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(*material_settings["diffuseColor"])
+            )
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
+                material_settings["roughness"]
+            )
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(
+                material_settings["metallic"]
+            )
+            if "emissiveColor" in material_settings:
+                shader.CreateInput(
+                    "emissiveColor", Sdf.ValueTypeNames.Color3f
+                ).Set(Gf.Vec3f(*material_settings["emissiveColor"]))
+            material.CreateSurfaceOutput().ConnectToSource(
+                shader.ConnectableAPI(), "surface"
+            )
+
+            floor = UsdGeom.Cube.Define(stage, spec["prim_path"])
+            floor.CreateSizeAttr(1.0)
+            floor.CreatePurposeAttr(UsdGeom.Tokens.render)
+            xform = UsdGeom.Xformable(floor.GetPrim())
+            parent_world = UsdGeom.Xformable(
+                floor.GetPrim().GetParent()
+            ).ComputeLocalToWorldTransform(time_code)
+            parent_world_values = np.asarray(
+                [
+                    [float(parent_world[row][column]) for column in range(4)]
+                    for row in range(4)
+                ],
+                dtype=np.float64,
+            )
+            local_matrix_values = local_matrix_for_world_box(
+                parent_world_values, spec["center"], spec["size"]
+            )
+            xform.ClearXformOpOrder()
+            transform_op = xform.AddTransformOp()
+            transform_op.Set(
+                Gf.Matrix4d(
+                    *[float(value) for value in local_matrix_values.reshape(-1)]
+                )
+            )
+            UsdShade.MaterialBindingAPI.Apply(floor.GetPrim()).Bind(
+                material, UsdShade.Tokens.strongerThanDescendants
+            )
+
+            world_matrix = xform.ComputeLocalToWorldTransform(time_code)
+            local_corners = [
+                Gf.Vec3d(x_value, y_value, z_value)
+                for x_value in (-0.5, 0.5)
+                for y_value in (-0.5, 0.5)
+                for z_value in (-0.5, 0.5)
+            ]
+            world_corners = np.asarray(
+                [world_matrix.Transform(corner) for corner in local_corners],
+                dtype=np.float64,
+            )
+            footprint = project_slab_corners_to_fisheye(camera, world_corners)
+            verification_cache = UsdGeom.BBoxCache(
+                time_code,
+                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                useExtentsHint=False,
+            )
+            actual_box = verification_cache.ComputeWorldBound(
+                floor.GetPrim()
+            ).ComputeAlignedBox()
+            actual_minimum = np.asarray(actual_box.GetMin(), dtype=np.float64)
+            actual_maximum = np.asarray(actual_box.GetMax(), dtype=np.float64)
+            intended_minimum = np.asarray(spec["minimum"], dtype=np.float64)
+            intended_maximum = np.asarray(spec["maximum"], dtype=np.float64)
+            maximum_error = float(
+                max(
+                    np.max(np.abs(actual_minimum - intended_minimum)),
+                    np.max(np.abs(actual_maximum - intended_maximum)),
+                )
+            )
+            if maximum_error > 0.001:
+                raise RuntimeError(
+                    "Floor composed world bounds do not match the intended box: "
+                    f"intendedMin={intended_minimum.tolist()} "
+                    f"intendedMax={intended_maximum.tolist()} "
+                    f"actualMin={actual_minimum.tolist()} "
+                    f"actualMax={actual_maximum.tolist()} "
+                    f"maxErrorM={maximum_error:.9f}"
+                )
+            runtime = {
+                "world_minimum": actual_minimum.tolist(),
+                "world_maximum": actual_maximum.tolist(),
+                "world_bounds_max_error_m": maximum_error,
+                "pixel_minimum": footprint["pixel_minimum"].tolist(),
+                "pixel_maximum": footprint["pixel_maximum"].tolist(),
+                "albedo": [float(value) for value in albedo],
+                "emissive": [float(value) for value in emissive],
+            }
+            print(
+                f"created floor {spec['prim_path']} albedo={runtime['albedo']} "
+                f"emissive={runtime['emissive']} "
+                f"actualWorldMin={runtime['world_minimum']} "
+                f"actualWorldMax={runtime['world_maximum']} "
+                f"worldBoundsMaxErrorM={maximum_error:.9f} "
+                f"pixelBBox=[{runtime['pixel_minimum']}, {runtime['pixel_maximum']}]",
+                flush=True,
+            )
+            return runtime
+
+        floor_specification = None
+        floor_coverage = None
+        floor_runtime = None
+        approximate_uncovered = []
 
         def bounds_for(prim):
             bounds = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
@@ -463,6 +1338,74 @@ def main() -> None:
                 s_prim_paths[name][part] = path
         kit.update()
         bbox_cache.Clear()
+
+        station_bounds_cache = UsdGeom.BBoxCache(
+            time_code,
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+            useExtentsHint=False,
+        )
+        station_root = stage.GetPrimAtPath("/TrayInspection")
+        station_box = station_bounds_cache.ComputeWorldBound(
+            station_root
+        ).ComputeAlignedBox()
+        station_minimum_z = float(station_box.GetMin()[2])
+        floor_specification, floor_coverage = floor_box_spec(
+            camera,
+            labeler_geometry,
+            station_minimum_z,
+        )
+        if not args.no_floor:
+            floor_runtime = create_floor_box(
+                floor_specification, args.floor_albedo, args.floor_emissive
+            )
+
+        authored_pixel_boxes = []
+        authored_bounds_cache = UsdGeom.BBoxCache(
+            time_code,
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+            useExtentsHint=False,
+        )
+        excluded_paths = {BACKDROP_PRIM_PATH, FLOOR_PRIM_PATH}
+        for prim in stage.Traverse():
+            if str(prim.GetPath()) in excluded_paths or not prim.IsA(UsdGeom.Boundable):
+                continue
+            try:
+                aligned = authored_bounds_cache.ComputeWorldBound(
+                    prim
+                ).ComputeAlignedBox()
+                minimum = np.asarray(aligned.GetMin(), dtype=np.float64)
+                maximum = np.asarray(aligned.GetMax(), dtype=np.float64)
+                if not np.all(np.isfinite(minimum)) or not np.all(
+                    np.isfinite(maximum)
+                ):
+                    continue
+                corners = [
+                    [x_value, y_value, z_value]
+                    for x_value in (minimum[0], maximum[0])
+                    for y_value in (minimum[1], maximum[1])
+                    for z_value in (minimum[2], maximum[2])
+                ]
+                footprint = project_slab_corners_to_fisheye(camera, corners)
+            except (ValueError, RuntimeError):
+                continue
+            authored_pixel_boxes.append(
+                (footprint["pixel_minimum"], footprint["pixel_maximum"])
+            )
+        approximate_uncovered = approximate_uncovered_crop_corners(
+            camera,
+            labeler_geometry,
+            PANEL_BOUNDS_XY,
+            None if args.no_backdrop else backdrop_spec,
+            None if args.no_floor else floor_specification,
+            authored_pixel_boxes=tuple(authored_pixel_boxes),
+        )
+        print(
+            "approximate crop background coverage (planar extents/projected AABBs; "
+            "occlusion ignored): "
+            f"authoredBounds={len(authored_pixel_boxes)} "
+            f"notFullyCovered={approximate_uncovered}",
+            flush=True,
+        )
 
         slot_prim_paths = {
             **{
@@ -1110,34 +2053,39 @@ def main() -> None:
         fill_record = prepare_light(fill_light)
 
         def randomize_light(light_record, intensity_range, scene_rng):
-            factor = scene_rng.uniform(*intensity_range)
-            kelvin = scene_rng.uniform(4200.0, 6200.0)
-            color = [
-                1.0,
-                scene_rng.uniform(0.92, 1.0),
-                scene_rng.uniform(0.85, 1.0),
-            ]
-            jitter = [scene_rng.uniform(-0.045, 0.045) for _ in range(3)]
-            prim = light_record["prim"]
-            prim.GetAttribute("inputs:intensity").Set(
-                light_record["base_intensity"] * factor
+            sample = sample_light_settings(
+                scene_rng,
+                intensity_range,
+                args.light_profile,
+                args.light_scale,
             )
+            prim = light_record["prim"]
+            intensity = (
+                light_record["base_intensity"] * sample["intensity_multiplier"]
+            )
+            prim.GetAttribute("inputs:intensity").Set(intensity)
             color_attribute = prim.GetAttribute("inputs:color")
             if color_attribute.IsValid():
-                color_attribute.Set(Gf.Vec3f(*color))
+                color_attribute.Set(Gf.Vec3f(*sample["color_rgb"]))
+            elif args.light_profile == "real":
+                raise RuntimeError(
+                    f"Real light profile requires inputs:color on {prim.GetPath()}"
+                )
             light_api = UsdLux.LightAPI(prim)
             light_api.CreateEnableColorTemperatureAttr(True).Set(True)
-            light_api.CreateColorTemperatureAttr(kelvin).Set(kelvin)
+            light_api.CreateColorTemperatureAttr(sample["color_temperature_k"]).Set(
+                sample["color_temperature_k"]
+            )
             light_record["transform_op"].Set(
                 light_record["world"]
-                * translation(jitter)
+                * translation(sample["position_jitter_m"])
                 * light_record["parent_inverse"]
             )
             return {
-                "intensity_factor": factor,
-                "color_temperature_k": kelvin,
-                "color_rgb": color,
-                "position_jitter_m": jitter,
+                **sample,
+                "base_intensity": light_record["base_intensity"],
+                "intensity": intensity,
+                "enable_color_temperature": True,
             }
 
         def write_crop(image, center, offsets, path):
@@ -1246,10 +2194,51 @@ def main() -> None:
                     "positive recorded strength"
                 )
 
+            floor_sample = sample_floor_emissive(
+                args.floor_emissive,
+                args.floor_brightness_jitter,
+                args.seed,
+                image_index,
+            )
+            floor_sample["enabled"] = not args.no_floor
+            floor_sample["applied"] = False
+            if not args.no_floor:
+                floor_shader = stage.GetPrimAtPath(
+                    f"{FLOOR_MATERIAL_PATH}/PreviewSurface"
+                )
+                emissive_attribute = floor_shader.GetAttribute(
+                    "inputs:emissiveColor"
+                )
+                if emissive_attribute.IsValid():
+                    emissive_attribute.Set(Gf.Vec3f(*floor_sample["emissive"]))
+                    floor_sample["applied"] = True
+                elif any(value > 0.0 for value in floor_sample["emissive"]):
+                    raise RuntimeError(
+                        "Non-zero floor emission requested but the floor shader has "
+                        "no inputs:emissiveColor"
+                    )
+            print(
+                f"floor {image_name}: emissive={floor_sample['emissive']} "
+                f"factor={floor_sample['brightness_factor']:.6f} "
+                f"redFactor={floor_sample['red_factor']:.6f} "
+                f"blueFactor={floor_sample['blue_factor']:.6f} "
+                f"applied={floor_sample['applied']}",
+                flush=True,
+            )
+
             lights = {
                 "key": randomize_light(key_record, (0.7, 1.8), scene_rng),
                 "fill": randomize_light(fill_record, (0.7, 2.5), scene_rng),
             }
+            print(
+                f"lighting {image_name}: profile={args.light_profile} "
+                f"scale={args.light_scale:.4f} "
+                f"keyIntensity={lights['key']['intensity']:.3f} "
+                f"keyTemperatureK={lights['key']['color_temperature_k']:.1f} "
+                f"fillIntensity={lights['fill']['intensity']:.3f} "
+                f"fillTemperatureK={lights['fill']['color_temperature_k']:.1f}",
+                flush=True,
+            )
             for _ in range(3):
                 kit.update()
             for _ in range(2):
@@ -1312,6 +2301,7 @@ def main() -> None:
                         for prefix in ("G", "S")
                     },
                     "lights": lights,
+                    "floor": floor_sample,
                     "seed": image_seed,
                     "shared_offset_px": shared_offset_px,
                     "camera_jitter": camera_jitter,
@@ -1334,6 +2324,14 @@ def main() -> None:
                     "git_commit": commit_hash,
                     "flags": flags,
                 },
+                "lighting": {
+                    "profile": args.light_profile,
+                    "scale": args.light_scale,
+                    "key_base_intensity": key_record["base_intensity"],
+                    "fill_base_intensity": fill_record["base_intensity"],
+                    "key_factor_range": [0.7, 1.8],
+                    "fill_factor_range": [0.7, 2.5],
+                },
                 "camera": {
                     "model": "opencv_fisheye",
                     "focal_px": focal,
@@ -1344,6 +2342,36 @@ def main() -> None:
                     "min_dtheta_d": float(camera["min_dtheta_d"]),
                     "render_size": [render_width, render_height],
                     "width_scale": args.width_scale,
+                },
+                "backdrop": {
+                    "enabled": not args.no_backdrop,
+                    "debug_material": args.backdrop_debug,
+                    "panel_bounds_xy": list(PANEL_BOUNDS_XY),
+                    "panel_surface_z": PANEL_SURFACE_Z,
+                    "image_left_world_side": image_left_side,
+                    "frame_minimum": backdrop_coverage["frame_minimum"].tolist(),
+                    "frame_maximum": backdrop_coverage["frame_maximum"].tolist(),
+                    "crops_minimum": backdrop_coverage["crops_minimum"].tolist(),
+                    "crops_maximum": backdrop_coverage["crops_maximum"].tolist(),
+                    "crop_overruns": backdrop_overruns,
+                    "slab": backdrop_spec if not args.no_backdrop else None,
+                    "runtime": backdrop_runtime,
+                },
+                "floor": {
+                    "enabled": not args.no_floor,
+                    "albedo": list(args.floor_albedo),
+                    "emissive": list(args.floor_emissive),
+                    "base_emissive": list(args.floor_emissive),
+                    "brightness_jitter_fraction": args.floor_brightness_jitter,
+                    "station_minimum_z": station_minimum_z,
+                    "frame_minimum": floor_coverage["frame_minimum"].tolist(),
+                    "frame_maximum": floor_coverage["frame_maximum"].tolist(),
+                    "box": floor_specification if not args.no_floor else None,
+                    "runtime": floor_runtime,
+                    "approximate_uncovered_crops": approximate_uncovered,
+                    "coverage_check_note": (
+                        "Approximate planar/projected-AABB coverage; occlusion ignored."
+                    ),
                 },
                 "crop_geometry": {
                     "source": "labeler_calibration",
