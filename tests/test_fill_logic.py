@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 import sys
 import unittest
@@ -15,15 +17,76 @@ if str(SCRIPTS) not in sys.path:
 
 from fill_logic import (
     ALL_SLOT_NAMES,
+    FillScene,
     G_SLOT_NAMES,
     OCCUPIED_CLASSES,
+    QUOTA_DAMAGE_TYPES,
+    QUOTA_DEFECT_CLASSES,
     SLOT_NAMES,
     S_SLOT_NAMES,
+    apply_quota_assignments,
+    build_quota_schedule,
     sample_fill_scene,
 )
 
 
 class FillLogicTests(unittest.TestCase):
+    def test_quota_schedule_balances_classes_and_damage_types(self) -> None:
+        for image_count in (8, 13, 100):
+            schedule = build_quota_schedule(image_count, 3)
+            for prefix in ("G", "S"):
+                assignments = [
+                    assignment
+                    for image_assignments in schedule[prefix]
+                    for assignment in image_assignments
+                ]
+                class_counts = Counter(
+                    assignment["class"] for assignment in assignments
+                )
+                self.assertEqual(set(class_counts), set(QUOTA_DEFECT_CLASSES))
+                self.assertLessEqual(
+                    max(class_counts.values()) - min(class_counts.values()), 1
+                )
+                damage_counts = Counter(
+                    assignment["damage_type"]
+                    for assignment in assignments
+                    if assignment["class"] == "damaged_vial"
+                )
+                self.assertEqual(set(damage_counts), set(QUOTA_DAMAGE_TYPES))
+                self.assertLessEqual(
+                    max(damage_counts.values()) - min(damage_counts.values()), 1
+                )
+
+    def test_quota_defects_stay_inside_filled_prefix(self) -> None:
+        for prefix, slot_names in (("G", G_SLOT_NAMES), ("S", S_SLOT_NAMES)):
+            source = FillScene(
+                labels={slot: "no_vial" for slot in slot_names},
+                not_yet_filled=list(slot_names),
+                expected_through=0,
+                missed_position=None,
+            )
+            assignments = build_quota_schedule(1, 3)[prefix][0]
+            scene, damage_types = apply_quota_assignments(
+                source,
+                prefix=prefix,
+                assignments=assignments,
+                rng=random.Random(1234),
+            )
+            self.assertEqual(scene.expected_through, 3)
+            self.assertIsNone(scene.missed_position)
+            self.assertEqual(scene.not_yet_filled, list(slot_names[3:]))
+            defective = {
+                slot
+                for slot, label in scene.labels.items()
+                if label in QUOTA_DEFECT_CLASSES
+            }
+            self.assertEqual(len(defective), 3)
+            self.assertTrue(defective.issubset(set(slot_names[:3])))
+            self.assertTrue(
+                all(scene.labels[slot] == "no_vial" for slot in slot_names[3:])
+            )
+            self.assertTrue(set(damage_types).issubset(defective))
+
     def test_fixture_slot_names_are_complete_and_disjoint(self) -> None:
         self.assertEqual(len(G_SLOT_NAMES), 30)
         self.assertEqual(len(S_SLOT_NAMES), 30)
@@ -62,6 +125,32 @@ class FillLogicTests(unittest.TestCase):
         left = [sample_fill_scene(left_rng) for _ in range(20)]
         right = [sample_fill_scene(right_rng) for _ in range(20)]
         self.assertEqual(left, right)
+
+    def test_quota_mode_off_legacy_sampler_snapshot(self) -> None:
+        rng = random.Random(314159)
+        scenes = [
+            sample_fill_scene(rng, prefix=prefix)
+            for _ in range(4)
+            for prefix in ("G", "S")
+        ]
+        payload = [
+            {
+                "labels": scene.labels,
+                "not_yet_filled": scene.not_yet_filled,
+                "expected_through": scene.expected_through,
+                "missed_position": scene.missed_position,
+            }
+            for scene in scenes
+        ]
+        digest = hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            digest,
+            "c70ec68587f8cf276e9476184e89b25ce6a1e19b496e7df59d7e1dada0f8b7c2",
+        )
 
     def test_class_balance_forces_each_requested_defect(self) -> None:
         rng = random.Random(73)
