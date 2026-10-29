@@ -25,6 +25,19 @@ class FillScene:
     missed_position: str | None
 
 
+def build_golden_fill_scene(prefix: str) -> FillScene:
+    """Return a completely filled, all-pass fixture for reference renders."""
+    if prefix not in ("G", "S"):
+        raise ValueError("prefix must be 'G' or 'S'")
+    slot_names = G_SLOT_NAMES if prefix == "G" else S_SLOT_NAMES
+    return FillScene(
+        labels={slot: "pass" for slot in slot_names},
+        not_yet_filled=[],
+        expected_through=30,
+        missed_position=None,
+    )
+
+
 def build_quota_schedule(
     image_count: int,
     defects_per_fixture: int,

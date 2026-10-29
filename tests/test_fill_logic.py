@@ -25,12 +25,22 @@ from fill_logic import (
     SLOT_NAMES,
     S_SLOT_NAMES,
     apply_quota_assignments,
+    build_golden_fill_scene,
     build_quota_schedule,
     sample_fill_scene,
 )
 
 
 class FillLogicTests(unittest.TestCase):
+    def test_golden_scene_is_fully_filled_and_all_pass(self) -> None:
+        for prefix, slot_names in (("G", G_SLOT_NAMES), ("S", S_SLOT_NAMES)):
+            scene = build_golden_fill_scene(prefix)
+            self.assertEqual(scene.expected_through, 30)
+            self.assertEqual(scene.not_yet_filled, [])
+            self.assertIsNone(scene.missed_position)
+            self.assertEqual(tuple(scene.labels), slot_names)
+            self.assertEqual(set(scene.labels.values()), {"pass"})
+
     def test_quota_schedule_balances_classes_and_damage_types(self) -> None:
         for image_count in (8, 13, 100):
             schedule = build_quota_schedule(image_count, 3)

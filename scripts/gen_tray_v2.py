@@ -25,6 +25,7 @@ from fill_logic import (
     QUOTA_DAMAGE_TYPES,
     S_SLOT_NAMES,
     apply_quota_assignments,
+    build_golden_fill_scene,
     build_quota_schedule,
     sample_fill_scene,
 )
@@ -684,6 +685,11 @@ def parse_args() -> argparse.Namespace:
         help="Use deterministic run-level class and damage-type quotas.",
     )
     parser.add_argument(
+        "--golden",
+        action="store_true",
+        help="Render fixed all-pass, fully filled reference images.",
+    )
+    parser.add_argument(
         "--defects-per-fixture",
         type=int,
         default=3,
@@ -837,7 +843,9 @@ def main() -> None:
             raise ValueError("--damage-weight must be non-negative")
         if not 0 <= args.defects_per_fixture <= 30:
             raise ValueError("--defects-per-fixture must be from 0 to 30")
-        if args.quota_mode and args.class_balance:
+        if args.golden and (args.quota_mode or args.class_balance):
+            print("--golden overrides --quota-mode and --class-balance", flush=True)
+        elif args.quota_mode and args.class_balance:
             print("--quota-mode overrides --class-balance", flush=True)
         if args.light_scale is None:
             args.light_scale = default_light_scale(args.light_profile)
@@ -2184,6 +2192,38 @@ def main() -> None:
                 "enable_color_temperature": True,
             }
 
+        def set_golden_light(light_record):
+            sample = {
+                "profile": "golden",
+                "intensity_factor": 1.0,
+                "intensity_scale": float(args.light_scale),
+                "intensity_multiplier": float(args.light_scale),
+                "color_temperature_k": 6500.0,
+                "color_rgb": [1.0, 1.0, 1.0],
+                "position_jitter_m": [0.0, 0.0, 0.0],
+            }
+            prim = light_record["prim"]
+            intensity = light_record["base_intensity"] * args.light_scale
+            prim.GetAttribute("inputs:intensity").Set(intensity)
+            color_attribute = prim.GetAttribute("inputs:color")
+            if not color_attribute.IsValid():
+                raise RuntimeError(
+                    f"Golden mode requires inputs:color on {prim.GetPath()}"
+                )
+            color_attribute.Set(Gf.Vec3f(1.0, 1.0, 1.0))
+            light_api = UsdLux.LightAPI(prim)
+            light_api.CreateEnableColorTemperatureAttr(True).Set(True)
+            light_api.CreateColorTemperatureAttr(6500.0).Set(6500.0)
+            light_record["transform_op"].Set(
+                light_record["world"] * light_record["parent_inverse"]
+            )
+            return {
+                **sample,
+                "base_intensity": light_record["base_intensity"],
+                "intensity": intensity,
+                "enable_color_temperature": True,
+            }
+
         def write_crop(image, center, offsets, path):
             center_x = int(round(center[0]))
             center_y = int(round(center[1]))
@@ -2210,14 +2250,15 @@ def main() -> None:
                 raise OSError(f"Could not write crop: {path}")
 
         master_rng = random.Random(args.seed)
+        quota_active = args.quota_mode and not args.golden
         quota_schedule = (
             build_quota_schedule(args.n, args.defects_per_fixture)
-            if args.quota_mode
+            if quota_active
             else None
         )
         quota_slot_rng = (
             random.Random(args.seed + QUOTA_SLOT_SEED_OFFSET)
-            if args.quota_mode
+            if quota_active
             else None
         )
         image_records = []
@@ -2228,22 +2269,28 @@ def main() -> None:
             image_name = f"{args.prefix}img_{image_index:04d}"
             image_seed = master_rng.randrange(0, 2**63)
             scene_rng = random.Random(image_seed)
-            fixture_scenes = {
-                prefix: sample_fill_scene(
-                    scene_rng,
-                    prefix=prefix,
-                    class_balance=args.class_balance and not args.quota_mode,
-                    damage_weight=args.damage_weight,
-                )
-                for prefix in ("G", "S")
-            }
+            if args.golden:
+                fixture_scenes = {
+                    prefix: build_golden_fill_scene(prefix)
+                    for prefix in ("G", "S")
+                }
+            else:
+                fixture_scenes = {
+                    prefix: sample_fill_scene(
+                        scene_rng,
+                        prefix=prefix,
+                        class_balance=args.class_balance and not args.quota_mode,
+                        damage_weight=args.damage_weight,
+                    )
+                    for prefix in ("G", "S")
+                }
             baseline_labels = {
                 name: label
                 for prefix in ("G", "S")
                 for name, label in fixture_scenes[prefix].labels.items()
             }
             quota_damage_kinds = {}
-            if args.quota_mode:
+            if quota_active:
                 for prefix in ("G", "S"):
                     fixture_scenes[prefix], fixture_damage_kinds = (
                         apply_quota_assignments(
@@ -2261,28 +2308,36 @@ def main() -> None:
             }
             if len(labels) != 60 or set(labels) != set(ALL_SLOT_NAMES):
                 raise AssertionError("Each image must contain exactly 60 G/S labels")
-            shared_offset_px = [
-                scene_rng.randint(-15, 15),
-                scene_rng.randint(-15, 15),
-            ]
-            requested_shift_px = list(shared_offset_px)
-            rotation_jitter_deg = [
-                scene_rng.uniform(-0.5, 0.5),
-                scene_rng.uniform(-0.5, 0.5),
-                scene_rng.uniform(-0.5, 0.5),
-            ]
-            (
-                jittered_rotation,
-                jittered_position,
-                translation_world,
-            ) = jitter_camera_pose(
-                rotation_world_to_cv,
-                camera_position,
-                focal,
-                reference_depth,
-                requested_shift_px,
-                rotation_jitter_deg,
-            )
+            if args.golden:
+                shared_offset_px = [0, 0]
+                requested_shift_px = [0, 0]
+                rotation_jitter_deg = [0.0, 0.0, 0.0]
+                jittered_rotation = rotation_world_to_cv.copy()
+                jittered_position = camera_position.copy()
+                translation_world = np.zeros(3, dtype=np.float64)
+            else:
+                shared_offset_px = [
+                    scene_rng.randint(-15, 15),
+                    scene_rng.randint(-15, 15),
+                ]
+                requested_shift_px = list(shared_offset_px)
+                rotation_jitter_deg = [
+                    scene_rng.uniform(-0.5, 0.5),
+                    scene_rng.uniform(-0.5, 0.5),
+                    scene_rng.uniform(-0.5, 0.5),
+                ]
+                (
+                    jittered_rotation,
+                    jittered_position,
+                    translation_world,
+                ) = jitter_camera_pose(
+                    rotation_world_to_cv,
+                    camera_position,
+                    focal,
+                    reference_depth,
+                    requested_shift_px,
+                    rotation_jitter_deg,
+                )
             camera_transform_op.Set(
                 usd_camera_matrix(jittered_rotation, jittered_position)
             )
@@ -2301,7 +2356,7 @@ def main() -> None:
                 "R_world_to_cv": jittered_rotation.tolist(),
             }
             variation_rng = scene_rng
-            if args.quota_mode:
+            if quota_active:
                 variation_rng = clone_random_generator(scene_rng)
                 shadow_labels = dict(baseline_labels)
                 for slot_name in ALL_SLOT_NAMES:
@@ -2320,7 +2375,7 @@ def main() -> None:
                     args.defect_boost,
                     forced_damage_kind=quota_damage_kinds.get(slot_name),
                 )
-            if args.quota_mode:
+            if quota_active:
                 for original_slot, damage_kind in list(
                     quota_damage_kinds.items()
                 ):
@@ -2399,7 +2454,7 @@ def main() -> None:
 
             floor_sample = sample_floor_emissive(
                 args.floor_emissive,
-                args.floor_brightness_jitter,
+                0.0 if args.golden else args.floor_brightness_jitter,
                 args.seed,
                 image_index,
             )
@@ -2429,12 +2484,18 @@ def main() -> None:
                 flush=True,
             )
 
-            lights = {
-                "key": randomize_light(key_record, (0.7, 1.8), scene_rng),
-                "fill": randomize_light(fill_record, (0.7, 2.5), scene_rng),
-            }
+            if args.golden:
+                lights = {
+                    "key": set_golden_light(key_record),
+                    "fill": set_golden_light(fill_record),
+                }
+            else:
+                lights = {
+                    "key": randomize_light(key_record, (0.7, 1.8), scene_rng),
+                    "fill": randomize_light(fill_record, (0.7, 2.5), scene_rng),
+                }
             print(
-                f"lighting {image_name}: profile={args.light_profile} "
+                f"lighting {image_name}: profile={lights['key']['profile']} "
                 f"scale={args.light_scale:.4f} "
                 f"keyIntensity={lights['key']['intensity']:.3f} "
                 f"keyTemperatureK={lights['key']['color_temperature_k']:.1f} "
@@ -2529,12 +2590,16 @@ def main() -> None:
                     "flags": flags,
                 },
                 "lighting": {
-                    "profile": args.light_profile,
+                    "profile": "golden" if args.golden else args.light_profile,
                     "scale": args.light_scale,
                     "key_base_intensity": key_record["base_intensity"],
                     "fill_base_intensity": fill_record["base_intensity"],
-                    "key_factor_range": [0.7, 1.8],
-                    "fill_factor_range": [0.7, 2.5],
+                    "key_factor_range": (
+                        [1.0, 1.0] if args.golden else [0.7, 1.8]
+                    ),
+                    "fill_factor_range": (
+                        [1.0, 1.0] if args.golden else [0.7, 2.5]
+                    ),
                 },
                 "camera": {
                     "model": "opencv_fisheye",
@@ -2566,7 +2631,9 @@ def main() -> None:
                     "albedo": list(args.floor_albedo),
                     "emissive": list(args.floor_emissive),
                     "base_emissive": list(args.floor_emissive),
-                    "brightness_jitter_fraction": args.floor_brightness_jitter,
+                    "brightness_jitter_fraction": (
+                        0.0 if args.golden else args.floor_brightness_jitter
+                    ),
                     "station_minimum_z": station_minimum_z,
                     "frame_minimum": floor_coverage["frame_minimum"].tolist(),
                     "frame_maximum": floor_coverage["frame_maximum"].tolist(),
@@ -2620,6 +2687,8 @@ def main() -> None:
                 "run_summary": run_summary,
                 "images": image_records,
             }
+            if args.golden:
+                labels_document["golden"] = True
             temporary_labels = labels_path.with_suffix(".json.tmp")
             temporary_labels.write_text(
                 json.dumps(labels_document, indent=2) + "\n", encoding="utf-8"

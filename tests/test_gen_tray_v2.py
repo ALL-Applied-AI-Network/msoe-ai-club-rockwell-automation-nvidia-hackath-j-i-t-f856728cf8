@@ -8,6 +8,7 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -30,6 +31,7 @@ from gen_tray_v2 import (
     labeler_grid_center,
     local_matrix_for_world_box,
     panel_crop_overruns,
+    parse_args,
     parse_nonnegative_rgb_triplet,
     project_slab_corners_to_fisheye,
     sample_floor_emissive,
@@ -40,6 +42,12 @@ from fill_logic import apply_quota_assignments, build_quota_schedule, sample_fil
 
 
 class GeneratorGeometryTests(unittest.TestCase):
+    def test_golden_cli_flag_defaults_off_and_can_be_enabled(self) -> None:
+        with patch.object(sys, "argv", ["gen_tray_v2.py"]):
+            self.assertFalse(parse_args().golden)
+        with patch.object(sys, "argv", ["gen_tray_v2.py", "--golden"]):
+            self.assertTrue(parse_args().golden)
+
     def test_run_summary_counts_labels_and_damage_types(self) -> None:
         summary = build_run_summary(
             [
