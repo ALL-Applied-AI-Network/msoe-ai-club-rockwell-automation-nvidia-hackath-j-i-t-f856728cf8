@@ -67,6 +67,28 @@ class FillLogicTests(unittest.TestCase):
                     max(damage_counts.values()) - min(damage_counts.values()), 1
                 )
 
+    def test_quota_schedule_respects_class_and_damage_filters(self) -> None:
+        schedule = build_quota_schedule(
+            4,
+            4,
+            quota_classes=("damaged_vial",),
+            damage_types=("lean_crush",),
+        )
+        for prefix in ("G", "S"):
+            assignments = [
+                assignment
+                for image_assignments in schedule[prefix]
+                for assignment in image_assignments
+            ]
+            self.assertEqual(
+                {assignment["class"] for assignment in assignments},
+                {"damaged_vial"},
+            )
+            self.assertEqual(
+                {assignment["damage_type"] for assignment in assignments},
+                {"lean_crush"},
+            )
+
     def test_quota_defects_stay_inside_filled_prefix(self) -> None:
         for prefix, slot_names in (("G", G_SLOT_NAMES), ("S", S_SLOT_NAMES)):
             source = FillScene(

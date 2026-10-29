@@ -23,6 +23,7 @@ from fill_logic import (
     ALL_SLOT_NAMES,
     G_SLOT_NAMES,
     QUOTA_DAMAGE_TYPES,
+    QUOTA_DEFECT_CLASSES,
     S_SLOT_NAMES,
     apply_quota_assignments,
     build_golden_fill_scene,
@@ -71,6 +72,58 @@ DEFAULT_FLOOR_ALBEDO = (0.36, 0.31, 0.22)
 DEFAULT_FLOOR_EMISSIVE = (0.15, 0.115, 0.07)
 FLOOR_JITTER_SEED_OFFSET = 0x464C4F4F52
 QUOTA_SLOT_SEED_OFFSET = 0x51554F5441
+
+
+def parse_ordered_choices(
+    value: str,
+    allowed: tuple[str, ...],
+    option_name: str,
+) -> tuple[str, ...]:
+    """Parse a non-empty, duplicate-free comma list from an allowed set."""
+    choices = tuple(part.strip() for part in value.split(",") if part.strip())
+    invalid = [choice for choice in choices if choice not in allowed]
+    if not choices or invalid or len(set(choices)) != len(choices):
+        allowed_text = ",".join(allowed)
+        raise argparse.ArgumentTypeError(
+            f"{option_name} must be a non-empty, duplicate-free comma list from "
+            f"{allowed_text}"
+        )
+    return choices
+
+
+def parse_quota_classes(value: str) -> tuple[str, ...]:
+    return parse_ordered_choices(value, QUOTA_DEFECT_CLASSES, "--quota-classes")
+
+
+def parse_damage_types(value: str) -> tuple[str, ...]:
+    return parse_ordered_choices(value, QUOTA_DAMAGE_TYPES, "--damage-types")
+
+
+def projected_points_crop_check(
+    center_pixel,
+    tip_pixel,
+    crop_center,
+    crop_offsets,
+) -> dict[str, object]:
+    """Report whether projected tube center and tip lie inside one crop."""
+    x0 = float(crop_center[0]) + float(crop_offsets[0])
+    y0 = float(crop_center[1]) + float(crop_offsets[1])
+    x1 = float(crop_center[0]) + float(crop_offsets[2])
+    y1 = float(crop_center[1]) + float(crop_offsets[3])
+
+    def inside(point) -> bool:
+        return x0 <= float(point[0]) <= x1 and y0 <= float(point[1]) <= y1
+
+    center_inside = inside(center_pixel)
+    tip_inside = inside(tip_pixel)
+    return {
+        "center_px": [float(center_pixel[0]), float(center_pixel[1])],
+        "tip_px": [float(tip_pixel[0]), float(tip_pixel[1])],
+        "crop_rect_px": [x0, y0, x1, y1],
+        "center_inside": center_inside,
+        "tip_inside": tip_inside,
+        "inside": center_inside and tip_inside,
+    }
 
 
 def labeler_grid_center(grid, position: int) -> tuple[float, float]:
@@ -685,6 +738,26 @@ def parse_args() -> argparse.Namespace:
         help="Use deterministic run-level class and damage-type quotas.",
     )
     parser.add_argument(
+        "--quota-classes",
+        type=parse_quota_classes,
+        default=QUOTA_DEFECT_CLASSES,
+        metavar="CLASS,...",
+        help=(
+            "Quota classes from missing_cap,crooked_cap,damaged_vial "
+            "(default: all)."
+        ),
+    )
+    parser.add_argument(
+        "--damage-types",
+        type=parse_damage_types,
+        default=QUOTA_DAMAGE_TYPES,
+        metavar="TYPE,...",
+        help=(
+            "Damage types from bend,crush,lean_crush,broken_top "
+            "(default: all)."
+        ),
+    )
+    parser.add_argument(
         "--golden",
         action="store_true",
         help="Render fixed all-pass, fully filled reference images.",
@@ -861,6 +934,16 @@ def main() -> None:
             raise NotImplementedError(
                 f"Camera view {args.camera_view!r} is not implemented; use 'top'"
             )
+        damage_sampler_types = (
+            DAMAGE_KINDS
+            if args.damage_types == QUOTA_DAMAGE_TYPES
+            else tuple(args.damage_types)
+        )
+        damage_weight_by_type = dict(zip(DAMAGE_KINDS, DAMAGE_WEIGHTS, strict=True))
+        damage_sampler_weights = tuple(
+            damage_weight_by_type[damage_type]
+            for damage_type in damage_sampler_types
+        )
         ensure_external_output(args.out)
 
         import cv2
@@ -1732,14 +1815,71 @@ def main() -> None:
                 limit = min(limit, max(0.0, entry))
             return limit
 
+        def damage_crop_projection(name, plan, crop_context):
+            tube = slot_info[name]["tube"]
+            center = (tube["minimum"] + tube["maximum"]) / 2.0
+            tip = np.array(
+                [center[0], center[1], tube["maximum"][2]],
+                dtype=np.float64,
+            )
+            direction = np.asarray(plan["direction"], dtype=np.float64)
+            kind = plan["kind"]
+            if kind in ("crush", "lean_crush"):
+                shift = float(plan["band_shift_m"]) * direction
+                center[:2] += shift
+                tip[:2] += shift
+            elif kind == "bend":
+                center[:2] += 0.25 * float(plan["amplitude"]) * direction
+                tip[:2] += float(plan["amplitude"]) * direction
+            elif kind == "broken_top":
+                tube_height = float(tube["maximum"][2] - tube["minimum"][2])
+                tip[2] = tube["minimum"][2] + (
+                    1.0 - float(plan["hidden_fraction"])
+                ) * tube_height
+
+            transform = crop_context["pre_damage_matrix"]
+            if kind == "lean_crush":
+                base_center = np.array(
+                    [
+                        (tube["minimum"][0] + tube["maximum"][0]) / 2.0,
+                        (tube["minimum"][1] + tube["maximum"][1]) / 2.0,
+                        tube["minimum"][2],
+                    ]
+                )
+                lean_axis = (-direction[1], direction[0], 0.0)
+                transform = transform * about(
+                    base_center,
+                    rotation(lean_axis, plan["tilt_degrees"]),
+                )
+
+            center_world = transform.Transform(Gf.Vec3d(*center))
+            tip_world = transform.Transform(Gf.Vec3d(*tip))
+            center_pixel = project(
+                center_world,
+                crop_context["cv_rotation"],
+                crop_context["cv_position"],
+            )
+            tip_pixel = project(
+                tip_world,
+                crop_context["cv_rotation"],
+                crop_context["cv_position"],
+            )
+            return projected_points_crop_check(
+                center_pixel,
+                tip_pixel,
+                crop_context["crop_center"],
+                crop_context["crop_offsets"],
+            )
+
         def sample_damage_plan(
             name,
             labels,
             scene_rng,
             defect_boost,
             forced_kind=None,
+            crop_context=None,
         ):
-            if forced_kind is not None and forced_kind not in DAMAGE_KINDS:
+            if forced_kind is not None and forced_kind not in damage_sampler_types:
                 raise ValueError(f"Unknown forced damage kind: {forced_kind!r}")
             tube = slot_info[name]["tube"]
             tube_height = max(
@@ -1747,7 +1887,7 @@ def main() -> None:
             )
             for attempt in range(MAX_DAMAGE_ATTEMPTS):
                 sampled_kind = scene_rng.choices(
-                    DAMAGE_KINDS, weights=DAMAGE_WEIGHTS, k=1
+                    damage_sampler_types, weights=damage_sampler_weights, k=1
                 )[0]
                 kind = forced_kind if forced_kind is not None else sampled_kind
                 direction = candidate_direction(name, labels, scene_rng, attempt)
@@ -1798,6 +1938,16 @@ def main() -> None:
                             strength=tilt_degrees,
                             crush_strength=1.0 - radius_scale,
                         )
+                        crop_check = damage_crop_projection(
+                            name, plan, crop_context
+                        )
+                        if not crop_check["inside"]:
+                            continue
+                        plan["crop_check"] = crop_check
+                    else:
+                        plan["crop_check"] = damage_crop_projection(
+                            name, plan, crop_context
+                        )
                     return plan
                 if kind == "bend":
                     amplitude = min(
@@ -1807,12 +1957,18 @@ def main() -> None:
                     if amplitude < MIN_BEND_SHIFT_M:
                         continue
                     plan.update(amplitude=amplitude, strength=amplitude)
+                    plan["crop_check"] = damage_crop_projection(
+                        name, plan, crop_context
+                    )
                     return plan
                 hidden_fraction = scene_rng.uniform(0.30, 0.50)
                 plan.update(
                     hidden_fraction=hidden_fraction,
                     cap_tilt_degrees=scene_rng.uniform(10.0, 20.0),
                     strength=hidden_fraction,
+                )
+                plan["crop_check"] = damage_crop_projection(
+                    name, plan, crop_context
                 )
                 return plan
             return None
@@ -1974,6 +2130,7 @@ def main() -> None:
             scene_rng,
             defect_boost,
             forced_damage_kind=None,
+            crop_context=None,
         ):
             label = labels[name]
             record = slot_info[name]
@@ -2049,12 +2206,15 @@ def main() -> None:
                 )
                 variation["crooked_tilt_deg"] = crooked_degrees
             elif label == "damaged_vial":
+                damage_crop_context = dict(crop_context)
+                damage_crop_context["pre_damage_matrix"] = lean_matrix
                 plan = sample_damage_plan(
                     name,
                     labels,
                     scene_rng,
                     defect_boost,
                     forced_kind=forced_damage_kind,
+                    crop_context=damage_crop_context,
                 )
                 if plan is None:
                     labels[name] = "pass"
@@ -2252,7 +2412,12 @@ def main() -> None:
         master_rng = random.Random(args.seed)
         quota_active = args.quota_mode and not args.golden
         quota_schedule = (
-            build_quota_schedule(args.n, args.defects_per_fixture)
+            build_quota_schedule(
+                args.n,
+                args.defects_per_fixture,
+                quota_classes=tuple(args.quota_classes),
+                damage_types=tuple(args.damage_types),
+            )
             if quota_active
             else None
         )
@@ -2348,6 +2513,17 @@ def main() -> None:
             crop_centers = translated_crop_centers(
                 labeler_geometry, shared_offset_px
             )
+            damage_crop_contexts = {
+                slot_name: {
+                    "cv_rotation": jittered_rotation,
+                    "cv_position": jittered_position,
+                    "crop_center": crop_centers[slot_name],
+                    "crop_offsets": labeler_geometry["fixtures"][
+                        slot_name[0]
+                    ]["crop_offsets"],
+                }
+                for slot_name in ALL_SLOT_NAMES
+            }
             camera_jitter = {
                 "requested_shift_px": requested_shift_px,
                 "translation_world_m": translation_world.tolist(),
@@ -2365,6 +2541,7 @@ def main() -> None:
                         shadow_labels,
                         scene_rng,
                         args.defect_boost,
+                        crop_context=damage_crop_contexts[slot_name],
                     )
             variations = {}
             for slot_name in ALL_SLOT_NAMES:
@@ -2374,6 +2551,7 @@ def main() -> None:
                     variation_rng,
                     args.defect_boost,
                     forced_damage_kind=quota_damage_kinds.get(slot_name),
+                    crop_context=damage_crop_contexts[slot_name],
                 )
             if quota_active:
                 for original_slot, damage_kind in list(
@@ -2400,6 +2578,7 @@ def main() -> None:
                             variation_rng,
                             args.defect_boost,
                             forced_damage_kind=damage_kind,
+                            crop_context=damage_crop_contexts[candidate],
                         )
                         if labels[candidate] == "damaged_vial":
                             replacement = candidate

@@ -41,12 +41,27 @@ def build_golden_fill_scene(prefix: str) -> FillScene:
 def build_quota_schedule(
     image_count: int,
     defects_per_fixture: int,
+    *,
+    quota_classes: tuple[str, ...] = QUOTA_DEFECT_CLASSES,
+    damage_types: tuple[str, ...] = QUOTA_DAMAGE_TYPES,
 ) -> dict[str, list[list[dict[str, str | None]]]]:
     """Build balanced per-fixture defect and damage schedules for a run."""
     if image_count < 1:
         raise ValueError("image_count must be at least 1")
     if not 0 <= defects_per_fixture <= 30:
         raise ValueError("defects_per_fixture must be from 0 to 30")
+    if not quota_classes or any(
+        label not in QUOTA_DEFECT_CLASSES for label in quota_classes
+    ):
+        raise ValueError("quota_classes must contain supported defect classes")
+    if len(set(quota_classes)) != len(quota_classes):
+        raise ValueError("quota_classes must not contain duplicates")
+    if not damage_types or any(
+        damage_type not in QUOTA_DAMAGE_TYPES for damage_type in damage_types
+    ):
+        raise ValueError("damage_types must contain supported damage types")
+    if len(set(damage_types)) != len(damage_types):
+        raise ValueError("damage_types must not contain duplicates")
 
     schedules: dict[str, list[list[dict[str, str | None]]]] = {}
     for prefix in ("G", "S"):
@@ -56,13 +71,11 @@ def build_quota_schedule(
         for _ in range(image_count):
             image_assignments = []
             for _ in range(defects_per_fixture):
-                label = QUOTA_DEFECT_CLASSES[class_index % len(QUOTA_DEFECT_CLASSES)]
+                label = quota_classes[class_index % len(quota_classes)]
                 class_index += 1
                 damage_type = None
                 if label == "damaged_vial":
-                    damage_type = QUOTA_DAMAGE_TYPES[
-                        damage_index % len(QUOTA_DAMAGE_TYPES)
-                    ]
+                    damage_type = damage_types[damage_index % len(damage_types)]
                     damage_index += 1
                 image_assignments.append(
                     {"class": label, "damage_type": damage_type}
