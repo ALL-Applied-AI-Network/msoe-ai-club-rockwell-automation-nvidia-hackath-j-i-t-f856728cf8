@@ -23,6 +23,8 @@ Run digital-twin generation on the DGX Spark through YAAD jobs. Copy scripts fro
 
 Factory inference runs locally on CPU from the exported TorchScript `model.pt`. It does not require Isaac Sim, TAO, a network connection, or pretrained-weight downloads at runtime.
 
+For complete Linux setup, camera calibration, operation, output interpretation, test-data collection, and troubleshooting instructions, see the [Factory Inference Runbook](docs/RUNBOOK.md).
+
 Create and activate a virtual environment, then install the pinned runtime packages:
 
 ```powershell
