@@ -30,6 +30,12 @@ try:
         select_tau,
         separate_no_vial_predictions,
     )
+    from model_preprocessing import (
+        IMAGE_SIZE,
+        IMAGENET_MEAN,
+        IMAGENET_STD,
+        build_evaluation_transform,
+    )
 except ModuleNotFoundError:
     from scripts.classifier_utils import (
         CLASS_NAMES,
@@ -42,9 +48,12 @@ except ModuleNotFoundError:
         select_tau,
         separate_no_vial_predictions,
     )
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+    from scripts.model_preprocessing import (
+        IMAGE_SIZE,
+        IMAGENET_MEAN,
+        IMAGENET_STD,
+        build_evaluation_transform,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--img-size", type=int, default=112)
+    parser.add_argument("--img-size", type=int, default=IMAGE_SIZE)
     parser.add_argument("--batch", type=int, default=128)
     return parser.parse_args()
 
@@ -137,13 +146,7 @@ def build_transforms(image_size: int):
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
     )
-    evaluation_transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ]
-    )
+    evaluation_transform = build_evaluation_transform(image_size)
     return train_transform, evaluation_transform
 
 
