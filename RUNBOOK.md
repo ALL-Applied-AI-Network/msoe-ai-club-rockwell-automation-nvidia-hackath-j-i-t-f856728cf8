@@ -163,15 +163,13 @@ scp yt-jit3783@172.30.102.95:/home/yt-jit3783/workspace/hackathon/live_videos/tr
    ```bash
    python capture.py --list
    ```
-2. **Terminal A: capture** with your indices. `--settings` opens each camera's driver dialog, where you turn off auto exposure, auto white balance and autofocus. Start with the empty tray in view, because the first still moment is saved as the empty tray.
+2. **Capture and check** with your indices (venv active). `--settings` opens each camera's driver dialog, where you turn off auto exposure, auto white balance and autofocus. Start with the empty tray in view, because the first still moment is saved as the empty tray.
    ```bash
    python capture.py --top 0 --side 1 --diag 2 --settings
    ```
-   It prints `capturing tray_0001 into live_frames/ ...`. Then, for the empty tray and after each placement, it prints `<time>  tray_0001_sNN saved`.
-3. **Terminal B: check** each tray as it fills (venv active):
-   ```bash
-   python live.py live_frames
-   ```
+   It prints `capturing tray_0001 into live_frames/ ...`, then `--- tray_0001  (<time>, empty tray saved)`. After each placement it checks that slot on the spot, the same way as step 5: one `GNN <verdict> ...` line, and the `vial check` window shows the dashboard. After `G30` it prints `tray_0001 done: {...}`. A second window, `capture`, shows the three cameras live, with the tray box yellow while something moves.
+
+   Every captured frame is also saved to `live_frames/`. To replay a tray afterwards, run `python live.py live_frames tray_0001 --pace 1`.
 
 - **Frame sizes.** The top camera must give 640×480, and the side and 45° cameras 1920×1080. `warning: <cam> gives WxH, resizing ...` means the slot boxes may be off.
 - **Keys in the capture window.**
@@ -274,10 +272,10 @@ These are the constants at the top of `infer.py`, picked on the 26 training tray
 | Path | In git | Made by | Used by |
 |---|---|---|---|
 | `slots_sim.json` | yes | `prep.py` | `infer.py`, `live.py`, `capture.py` |
-| `ref_side_empty.png` | no | `prep.py` (copy of `train_0000`'s side `s00`) | `infer.py`, `live.py` |
+| `ref_side_empty.png` | no | `prep.py` (copy of `train_0000`'s side `s00`) | `infer.py`, `live.py`, `capture.py` |
 | `data_sim/{train,val}/<class>/` | no | `prep.py` | `train.py` |
-| `models/{cap,vial,empty}.pt` | no | `train.py` | `infer.py`, `live.py` |
-| `live_frames/{top,side,diag}/` | no | `capture.py` | `live.py` |
+| `models/{cap,vial,empty}.pt` | no | `train.py` | `infer.py`, `live.py`, `capture.py` |
+| `live_frames/{top,side,diag}/` | no | `capture.py` | `live.py`, to replay a captured tray |
 | `live_videos/<tray>.mp4` | no | `live.py` on a machine with no display | you, to watch the dashboard |
 | `cam_<i>.png` | no | `capture.py --list` | you, to identify the cameras |
 
@@ -315,7 +313,8 @@ Write each file atomically: write a temp file, then rename it, as `capture.save`
 | `camera N didn't open` | Wrong index, or not on Windows | `python capture.py --list` on Windows |
 | `live.py` prints nothing, then `no empty-tray frames <tray>_s00.png under ...` after 60 s | That tray's `s00` is missing from one of `top/`, `side/`, `diag/` | Make sure all three files exist; `--timeout` waits longer |
 | `python live.py live_frames` shows nothing | No `*_s00.png` in `live_frames/top/` yet; it waits without printing | Start `capture.py` first |
-| `no state N within 60 s, stopping this tray` | Capture missed a placement, or stopped | Press Space in the capture window to save the missed state |
+| `no state N within 60 s, stopping this tray` | Replaying a tray whose capture stopped before `s30` | Expected for an unfinished tray |
+| `capture.py` verdicts look shifted by one slot | It missed a placement, so its step count is one behind the vials on the tray | Press Space before the next placement to save the missed state; see the next row |
 | Placements missed or doubled | The arm paused over the tray longer than `--settle`, or the scene is noisy | Tune `--settle` and `--motion-px`, or capture with Space |
 | Slot boxes off target on real cameras | The geometry is fit to the digital twin | Real cameras need their own calibration (see Limits) |
 

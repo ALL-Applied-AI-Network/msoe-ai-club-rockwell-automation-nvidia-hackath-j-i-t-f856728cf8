@@ -4,7 +4,7 @@ Frames arrive as <frames>/<cam>/<tray>_sSS.png for cam in top / side / diag (the
 state 00 is the empty tray, state k has vials 1..k (vial k went into slot k, fill order G01..G30).
 
 python live.py dataset_v1_partial/dataset_v1_partial/frames train_0031 --pace 1   # replay a recorded tray, 1 s a step
-python live.py live_frames                    # follow capture.py: newest tray, then each new one as it starts
+python live.py live_frames                    # replay / follow the frames capture.py saved: newest tray, then new ones
 Esc closes the window. With no display (the Spark over ssh) there is no window: each tray's dashboard is saved as
 live_videos/<tray>.mp4 instead (--videos), one frame per step.
 """
@@ -91,6 +91,17 @@ def dashboard(k, after, verdicts, p, side, tilt, sky, table, ms):
                         cv2.hconcat([panel, size(dg, 640, 360)])])
 
 
+def check(k, before, after, sky, verdicts, models, table, dev):
+    """Check fill state k into verdicts, print its line and return the dashboard frame (live.py and capture.py)."""
+    t0 = time.perf_counter()
+    verdicts[k], p, side, tilt = check_step(k, before, after, sky, models, table, dev)
+    ms = (time.perf_counter() - t0) * 1000
+    print(f"G{k:02d} {verdicts[k]:<12} cap {p['cap']:.2f} vial {p['vial']:.2f} empty {p['empty']:.2f}  "
+          + ("side -" if side is None else f"rise {side[0]:+.1f} dome {side[1]:.2f}")
+          + ("  45deg -" if tilt is None else f"  tilt {tilt:.3f}") + f"  ({ms:.0f} ms)")
+    return dashboard(k, after, verdicts, p, side, tilt, sky, table, ms)
+
+
 def follow(frames):
     """Tray ids in arrival order: the newest tray already started, then each new one as its empty-tray frame lands."""
     last = None
@@ -120,13 +131,7 @@ def run_tray(frames, tray, models, table, ref_empty, dev, pace, timeout, videos=
             if after is None:
                 print(f"no state {k} within {timeout:.0f} s, stopping this tray")
                 break
-            t0 = time.perf_counter()
-            verdicts[k], p, side, tilt = check_step(k, before, after, sky, models, table, dev)
-            ms = (time.perf_counter() - t0) * 1000
-            print(f"G{k:02d} {verdicts[k]:<12} cap {p['cap']:.2f} vial {p['vial']:.2f} empty {p['empty']:.2f}  "
-                  + ("side -" if side is None else f"rise {side[0]:+.1f} dome {side[1]:.2f}")
-                  + ("  45deg -" if tilt is None else f"  tilt {tilt:.3f}") + f"  ({ms:.0f} ms)")
-            view = dashboard(k, after, verdicts, p, side, tilt, sky, table, ms)
+            view = check(k, before, after, sky, verdicts, models, table, dev)
             if videos:
                 if video is None:  # one frame per step, played back at one step per --pace seconds
                     video = cv2.VideoWriter(str(videos / f"{tray}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),

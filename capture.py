@@ -1,9 +1,9 @@
-"""Grab one frame from each USB camera after every placement, into the layout live.py follows:
+"""live.py for USB cameras: grab one frame from each camera after every placement and check it on the spot,
+with the same dashboard and per-step lines. The frames are also saved, so live.py can replay a tray later:
     <out>/{top,side,diag}/<tray>_sSS.png      s00 = empty tray, sNN = after vial NN went in
 
 python capture.py --list                                  # which index is which camera (saves cam_<i>.png)
-python capture.py --top 0 --side 1 --diag 2 --settings    # lock exposure / focus / white balance, then capture
-python live.py live_frames                                # second terminal: check each tray as it fills
+python capture.py --top 0 --side 1 --diag 2 --settings    # lock exposure / focus / white balance, then check
 
 A placement = something moves over the tray in the top view (the arm), then the tray stays still for --settle s.
 That also fires when the arm comes and goes without leaving a vial, so state k always lines up with slot k.
@@ -13,10 +13,16 @@ import argparse
 import json
 import os
 import time
+from collections import Counter
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
+
+from infer import load_models
+from live import WIN, check
+from skyline import episode_skyline
 
 SIZES = {"top": (640, 480), "side": (1920, 1080), "diag": (1920, 1080)}  # what models / references were built for
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -124,22 +130,31 @@ def main():
     ap.add_argument("--settle", type=float, default=1.0, help="seconds of stillness that end a placement")
     ap.add_argument("--motion-px", type=int, default=40, help="changed pixels in the tray area that count as motion")
     ap.add_argument("--settings", action="store_true", help="open each camera's driver dialog to lock exposure etc.")
+    ap.add_argument("--models", default="models")
     args = ap.parse_args()
     if args.list:
         return list_cams()
     if None in (args.top, args.side, args.diag):
         raise SystemExit("give --top, --side and --diag camera indices (python capture.py --list)")
 
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    models, table = load_models(args.models, dev), json.loads(Path("slots_sim.json").read_text())
+    ref_empty = cv2.imread("ref_side_empty.png")
     caps = {cam: open_cam(i, SIZES[cam], args.settings) for cam, i in (("top", args.top), ("side", args.side), ("diag", args.diag))}
     for cam, cap in caps.items():
         w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         if (w, h) != SIZES[cam]:
             print(f"warning: {cam} gives {w:.0f}x{h:.0f}, resizing to {SIZES[cam]}; slot positions may be off")
-    boxes = np.array(list(json.loads(Path("slots_sim.json").read_text())["top"].values()))
+    boxes = np.array(list(table["top"].values()))
     roi = (int(boxes[:, 0].min()) - 10, int(boxes[:, 1].min()) - 10, int(boxes[:, 2].max()) + 10, int(boxes[:, 3].max()) + 10)
     trigger = PlacementTrigger(roi, args.settle, args.motion_px)
-    tray, s = next_tray(args.out, args.prefix), 0
+    tray, s, verdicts = next_tray(args.out, args.prefix), 0, {}
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     print(f"capturing {tray} into {args.out}/ ... Space = capture now, N = new tray, Esc = quit")
+
+    def done():  # the tray's tally, as live.py prints it
+        if verdicts:
+            print(f"{tray} done:", dict(Counter(verdicts.values())))
 
     while True:
         frames = read_all(caps)
@@ -148,14 +163,21 @@ def main():
         if key == 27:
             break
         if key in (ord("n"), ord("N")):
-            tray, s = next_tray(args.out, args.prefix), 0
+            done()
+            tray, s, verdicts = next_tray(args.out, args.prefix), 0, {}
             print(f"new tray {tray}: next capture is its empty tray")
         elif fire or key == ord(" "):
             save(frames, args.out, tray, s)
-            print(f"{time.strftime('%H:%M:%S')}  {tray}_s{s:02d} saved")
+            if s == 0:  # the empty tray: what step 1 is compared against, and where this tray's skyline sits
+                print(f"--- {tray}  ({time.strftime('%H:%M:%S')}, empty tray saved)")
+                sky = episode_skyline(frames["side"], ref_empty, table["side_ref_skyline"])
+            else:
+                cv2.imshow(WIN, check(s, before, frames, sky, verdicts, models, table, dev))
+            before = frames
             s += 1
             if s > 30:  # tray full: the next capture is the next tray's empty state
-                tray, s = next_tray(args.out, args.prefix), 0
+                done()
+                tray, s, verdicts = next_tray(args.out, args.prefix), 0, {}
         cv2.imshow("capture", preview(frames, roi, tray, s, trigger.moving))
     for cap in caps.values():
         cap.release()
