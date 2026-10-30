@@ -47,3 +47,12 @@ id_ed25519*
 *.pem
 *.tar.gz
 .vscode-server/
+
+# Ash's ResNet checker: local datasets, crops, captures and trained weights (regenerate with prep.py / train.py)
+dataset*/
+data_sim/
+frames/
+live_frames/
+models/
+ref_side_empty.png
+cam_*.png
