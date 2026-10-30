@@ -14,9 +14,14 @@ PASS_INDEX = 0
 NO_VIAL_INDEX = 4
 
 
-def load_manifest(data_root: Path, split: str) -> list[dict[str, str]]:
-    """Load and validate one split from a crop manifest."""
-    manifest_path = data_root / "manifest.csv"
+def load_manifest(
+    data_root: Path,
+    split: str,
+    manifest_path: Path | None = None,
+) -> list[dict[str, str]]:
+    """Load one split and resolve its crop paths relative to ``data_root``."""
+    if manifest_path is None:
+        manifest_path = data_root / "manifest.csv"
     required = {"path", "label", "split", "job", "image_id", "slot", "damage_type"}
     with manifest_path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)

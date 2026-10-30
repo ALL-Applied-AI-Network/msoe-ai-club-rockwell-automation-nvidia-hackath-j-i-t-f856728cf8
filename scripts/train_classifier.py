@@ -50,6 +50,11 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Manifest CSV; defaults to manifest.csv under --data.",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
@@ -275,9 +280,9 @@ def main() -> None:
     seed_everything(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
 
-    train_rows = load_manifest(args.data, "train")
-    validation_rows = load_manifest(args.data, "val")
-    test_rows = load_manifest(args.data, "test")
+    train_rows = load_manifest(args.data, "train", args.manifest)
+    validation_rows = load_manifest(args.data, "val", args.manifest)
+    test_rows = load_manifest(args.data, "test", args.manifest)
     train_transform, evaluation_transform = build_transforms(args.img_size)
     train_dataset = CropDataset(train_rows, train_transform)
     validation_dataset = CropDataset(validation_rows, evaluation_transform)

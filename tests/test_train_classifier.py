@@ -107,6 +107,46 @@ class ClassifierUtilityTests(unittest.TestCase):
         self.assertIn("missing_val.png", message)
         self.assertIn("missing_test.png", message)
 
+    def test_load_manifest_accepts_manifest_outside_data_root(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        data_root = root / "extracted"
+        image_path = data_root / "data" / "train" / "pass" / "crop.png"
+        image_path.parent.mkdir(parents=True)
+        image_path.write_bytes(b"test")
+        manifest_path = root / "input" / "manifest.csv"
+        manifest_path.parent.mkdir()
+        with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "path",
+                    "label",
+                    "split",
+                    "job",
+                    "image_id",
+                    "slot",
+                    "damage_type",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "path": "data/train/pass/crop.png",
+                    "label": "pass",
+                    "split": "train",
+                    "job": "job-a",
+                    "image_id": "image-1",
+                    "slot": "G01",
+                    "damage_type": "",
+                }
+            )
+
+        rows = load_manifest(data_root, "train", manifest_path)
+
+        self.assertEqual(Path(rows[0]["absolute_path"]), image_path)
+
     def test_select_tau_meets_recall_with_lowest_false_alarm_rate(self) -> None:
         probabilities = [
                 [0.90, 0.04, 0.03, 0.02, 0.01],
