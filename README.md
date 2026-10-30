@@ -41,7 +41,7 @@ The checked-in `slots_G.json` contains the 30 calibrated G-fixture ROIs for 1920
 python scripts/define_slots.py --image C:\factory\reference.png --out slots_G.json
 ```
 
-Run one image with the default `P(pass) < 0.90` defect threshold:
+Run one image with the default `P(pass) < 0.70` defect threshold:
 
 ```powershell
 python scripts/predict.py --weights weights/model.pt --image C:\factory\tray.png --slots slots_G.json --out-dir C:\factory\predictions

@@ -79,22 +79,22 @@ All examples below use the real flags exposed by `python scripts/predict.py --he
 Process one image:
 
 ```bash
-python scripts/predict.py --weights weights/model.pt --image ../factory-runtime/incoming/tray_000001.png --slots slots_G.json --threshold 0.90 --out-dir ../factory-runtime/predictions
+python scripts/predict.py --weights weights/model.pt --image ../factory-runtime/incoming/tray_000001.png --slots slots_G.json --threshold 0.70 --out-dir ../factory-runtime/predictions
 ```
 
 Poll a folder every two seconds. Existing supported images are processed once when the program starts, and new images are processed as they appear. Stop with Ctrl+C:
 
 ```bash
-python scripts/predict.py --weights weights/model.pt --watch-dir ../factory-runtime/incoming --slots slots_G.json --threshold 0.90 --poll-seconds 2 --out-dir ../factory-runtime/predictions
+python scripts/predict.py --weights weights/model.pt --watch-dir ../factory-runtime/incoming --slots slots_G.json --threshold 0.70 --poll-seconds 2 --out-dir ../factory-runtime/predictions
 ```
 
 Read camera index 0 every two seconds. Stop with Ctrl+C:
 
 ```bash
-python scripts/predict.py --weights weights/model.pt --camera-index 0 --slots slots_G.json --threshold 0.90 --poll-seconds 2 --out-dir ../factory-runtime/predictions
+python scripts/predict.py --weights weights/model.pt --camera-index 0 --slots slots_G.json --threshold 0.70 --poll-seconds 2 --out-dir ../factory-runtime/predictions
 ```
 
-The `0.90` value is the software default and is suitable for a wiring smoke test, not a finalized production setting. Record and deploy the threshold selected from validation results.
+The `0.70` value is the software default and validation-derived factory starting value. It remains configurable with `--threshold`.
 
 ## Reading the output
 
@@ -109,7 +109,7 @@ Green means `PASS`; red means `DEFECT`. Always investigate red boxes, and also i
 The console prints one line per tray in this form:
 
 ```text
-image=tray_000001.png slots=30 pass=28 defects=2 threshold=0.900
+image=tray_000001.png slots=30 pass=28 defects=2 threshold=0.700
 ```
 
 Archive CSV and JSON outputs with the corresponding source image when traceability is required.
@@ -181,6 +181,16 @@ Use a second reviewer for ambiguous defects. Freeze the labeled real test set be
   4. `damaged_vial`
   5. `no_vial`
 - Defect rule: flag `DEFECT` when `P(pass) < threshold`, regardless of the top class
-- Final production threshold: **TBD from validation**
+- Factory starting threshold: **0.70**
+
+Validation sweep:
+
+| Threshold | Defects missed | False alarms |
+|---:|---:|---:|
+| 0.60 | 3.5% | 3.1% |
+| 0.70 | 3.0% | 7.9% |
+| 0.80 | 2.6% | 24.0% |
+
+The `tau` value stored in `model_card.json` must not be used as the factory threshold. It comes from the training script's internal validation selection and, for this model, `tau=0.926` flags about 92% of good validation vials. Use `0.70` as the factory start value unless a later documented validation sweep replaces it.
 
 The asymmetric inspection objective favors defect recall: a missed defect is more costly than a false alarm. Record the final validation-derived threshold, model commit, training dataset version, and validation metrics before deployment.

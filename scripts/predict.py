@@ -25,7 +25,7 @@ except ModuleNotFoundError:
 
 EXPECTED_SLOTS = tuple(f"G{index:02d}" for index in range(1, 31))
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
-DEFAULT_THRESHOLD = 0.90
+DEFAULT_THRESHOLD = 0.70
 
 
 @dataclass(frozen=True)

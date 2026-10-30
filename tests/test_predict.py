@@ -11,6 +11,7 @@ import numpy as np
 from scripts.define_slots import DEFAULT_CROP_OFFSETS, slot_document
 from scripts.model_preprocessing import IMAGE_SIZE, IMAGENET_MEAN, IMAGENET_STD
 from scripts.predict import (
+    DEFAULT_THRESHOLD,
     SlotROI,
     extract_crops,
     load_slots,
@@ -21,6 +22,9 @@ from scripts.predict import (
 
 
 class FactoryPredictionTests(unittest.TestCase):
+    def test_factory_default_threshold_is_validation_start_value(self) -> None:
+        self.assertEqual(DEFAULT_THRESHOLD, 0.70)
+
     def test_checked_in_slots_cover_all_g_positions_with_training_crop_size(self) -> None:
         slots_path = Path(__file__).resolve().parents[1] / "slots_G.json"
 
