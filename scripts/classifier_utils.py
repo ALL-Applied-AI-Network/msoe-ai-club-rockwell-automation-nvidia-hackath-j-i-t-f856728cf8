@@ -23,15 +23,24 @@ def load_manifest(data_root: Path, split: str) -> list[dict[str, str]]:
         if reader.fieldnames is None or not required.issubset(reader.fieldnames):
             missing = sorted(required - set(reader.fieldnames or ()))
             raise ValueError(f"Manifest is missing columns: {missing}")
-        rows = [dict(row) for row in reader if row["split"] == split]
+        manifest_rows = [dict(row) for row in reader]
+    missing_paths = [
+        data_root / Path(row["path"])
+        for row in manifest_rows
+        if not (data_root / Path(row["path"])).is_file()
+    ]
+    if missing_paths:
+        details = "\n".join(f"  - {path}" for path in missing_paths)
+        raise FileNotFoundError(
+            f"Manifest references {len(missing_paths)} missing file(s):\n{details}"
+        )
+    rows = [row for row in manifest_rows if row["split"] == split]
     if not rows:
         raise ValueError(f"Manifest has no rows for split {split!r}")
     for row in rows:
         if row["label"] not in CLASS_NAMES:
             raise ValueError(f"Unknown label {row['label']!r}")
         path = data_root / Path(row["path"])
-        if not path.is_file():
-            raise FileNotFoundError(path)
         row["absolute_path"] = str(path)
     return rows
 

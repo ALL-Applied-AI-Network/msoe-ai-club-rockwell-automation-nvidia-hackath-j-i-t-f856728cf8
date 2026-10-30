@@ -62,6 +62,51 @@ class ClassifierUtilityTests(unittest.TestCase):
         self.assertEqual(rows[0]["image_id"], "image-1")
         self.assertEqual(Path(rows[0]["absolute_path"]), image_path)
 
+    def test_load_manifest_reports_all_missing_files_across_splits(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        fieldnames = [
+            "path",
+            "label",
+            "split",
+            "job",
+            "image_id",
+            "slot",
+            "damage_type",
+        ]
+        with (root / "manifest.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for split, filename in (
+                ("train", "missing_train.png"),
+                ("val", "missing_val.png"),
+                ("test", "missing_test.png"),
+            ):
+                writer.writerow(
+                    {
+                        "path": f"data/{split}/pass/{filename}",
+                        "label": "pass",
+                        "split": split,
+                        "job": "job-a",
+                        "image_id": split,
+                        "slot": "G01",
+                        "damage_type": "",
+                    }
+                )
+
+        with self.assertRaisesRegex(
+            FileNotFoundError, r"Manifest references 3 missing file\(s\)"
+        ) as context:
+            load_manifest(root, "train")
+
+        message = str(context.exception)
+        self.assertIn("missing_train.png", message)
+        self.assertIn("missing_val.png", message)
+        self.assertIn("missing_test.png", message)
+
     def test_select_tau_meets_recall_with_lowest_false_alarm_rate(self) -> None:
         probabilities = [
                 [0.90, 0.04, 0.03, 0.02, 0.01],
