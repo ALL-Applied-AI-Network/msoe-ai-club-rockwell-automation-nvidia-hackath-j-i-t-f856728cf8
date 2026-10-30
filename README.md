@@ -102,6 +102,12 @@ Esc closes it.
 
 `capture.py` grabs one frame per camera after every placement and checks that slot on the spot, with the same dashboard as the replay. Frames stay in memory; nothing is saved. It counts a placement when something moves over the tray in the top view and the tray then stays still for `--settle` seconds (default 1). The first still moment is taken as the empty tray. Keys: Space captures now, N starts a new tray, Esc quits.
 
+No cameras? `--frames` streams a recorded tray through the same path, one state every `--pace` seconds (default 2):
+
+```bash
+python capture.py --frames dataset_v1_partial/dataset_v1_partial/frames --tray train_0031
+```
+
 Expected sizes are top 640×480 and side / 45° 1920×1080. `live.py` also follows a frames folder as it fills, so another frame source (Isaac Sim, a robot "placed" signal) only has to write these files:
 
 ```

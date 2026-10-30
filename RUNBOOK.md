@@ -17,7 +17,7 @@ Do the steps in order. Each one says what you should see. If you see something e
 |---|---|
 | Check that the checker works | 1, 2, 3, 4 |
 | Watch a recorded tray | 1, 2, 5 |
-| Run on the USB cameras (Windows only) | 1, 2, 6 |
+| Run on the USB cameras (Windows only), or try the camera path on a recording | 1, 2, 6 |
 | No `models/` yet, or the dataset changed | 1, 2, [R1](#r1-rebuild-crops-and-references-preppy), [R2](#r2-retrain-the-three-top-view-models-trainpy), 3, 4 |
 
 ### Step 1. Install (once per machine)
@@ -179,6 +179,11 @@ scp yt-jit3783@172.30.102.95:/home/yt-jit3783/workspace/hackathon/live_videos/tr
   - After `G30`, the next capture starts a new tray by itself.
 - **What counts as a placement.** Motion over the tray in the top view, then `--settle` seconds of stillness (default 1.0). Motion means more than `--motion-px` changed pixels (default 40).
 - **Restarting.** Tray numbers start again at `tray_0001`.
+- **Without cameras.** `--frames` feeds a recorded tray in place of the three cameras, so you can try this step with no hardware. It shows one state every `--pace` seconds (default 2, must be more than `--settle`). A black frame comes before each state, standing in for the arm passing, so the trigger also fires for empty slots. After the last state the stream holds its last frame, and Esc quits.
+  ```bash
+  python capture.py --frames dataset_v1_partial/dataset_v1_partial/frames --tray train_0031
+  ```
+  The 30 `GNN` lines match step 5's replay of the same tray, apart from the ms times. A run takes about 62 s.
 
 ---
 

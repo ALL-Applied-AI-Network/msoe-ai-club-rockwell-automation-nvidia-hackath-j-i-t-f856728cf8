@@ -3,6 +3,7 @@ with the same dashboard and per-step lines. Frames stay in memory (only the prev
 
 python capture.py --list                                 # which index is which camera (saves cam_<i>.png)
 python capture.py --top 0 --side 1 --diag 2 --settings    # lock exposure / focus / white balance, then check
+python capture.py --frames dataset_v1_partial/dataset_v1_partial/frames --tray train_0031   # no cameras: a recording
 
 A placement = something moves over the tray in the top view (the arm), then the tray stays still for --settle s.
 That also fires when the arm comes and goes without leaving a vial, so state k always lines up with slot k.
@@ -30,7 +31,7 @@ class PlacementTrigger:
     """Fires once the tray has stayed still for `settle` s after something moved over it.
     Starts armed, so the first still moment captures the empty tray."""
     # ponytail: motion-based; if the arm ever pauses over the tray longer than `settle`, swap this for the
-    # robot's own "placed" signal (call save() when it arrives)
+    # robot's own "placed" signal (capture when it arrives)
 
     def __init__(self, roi, settle=1.0, motion_px=40):
         self.roi, self.settle, self.motion_px = roi, settle, motion_px
@@ -66,6 +67,35 @@ def open_cam(index, size, settings):
     if settings:
         cap.set(cv2.CAP_PROP_SETTINGS, 1)
     return cap
+
+
+class FolderCam:
+    """Stands in for a camera (--frames): plays a recorded tray <frames>/<cam>/<tray>_sSS.png, one state every
+    `pace` s from t0, then holds the last one. Each new state opens with one black frame, the arm passing over the
+    tray, so the placement trigger fires even for a slot left empty (where the picture doesn't change)."""
+
+    def __init__(self, frames, cam, tray, pace, t0):
+        self.paths = sorted((Path(frames) / cam).glob(f"{tray}_s??.png"))
+        if not self.paths:
+            raise SystemExit(f"no {tray}_sSS.png under {Path(frames) / cam}")
+        self.pace, self.t0, self.i, self.arm = pace, t0, -1, False
+        self.img = cv2.imread(str(self.paths[0]))
+
+    def grab(self):
+        i = min(int((time.monotonic() - self.t0) / self.pace), len(self.paths) - 1)
+        if i != self.i:
+            self.i, self.img, self.arm = i, cv2.imread(str(self.paths[i])), True
+        return True
+
+    def retrieve(self):
+        img, self.arm = (np.zeros_like(self.img) if self.arm else self.img), False
+        return True, img
+
+    def get(self, prop):
+        return self.img.shape[1] if prop == cv2.CAP_PROP_FRAME_WIDTH else self.img.shape[0]
+
+    def release(self):
+        pass
 
 
 def read_all(caps):
@@ -112,16 +142,25 @@ def main():
     ap.add_argument("--motion-px", type=int, default=40, help="changed pixels in the tray area that count as motion")
     ap.add_argument("--settings", action="store_true", help="open each camera's driver dialog to lock exposure etc.")
     ap.add_argument("--models", default="models")
+    ap.add_argument("--frames", help="no cameras: play a recorded tray from this folder (top/ side/ diag/) instead")
+    ap.add_argument("--tray", default="train_0031", help="with --frames: which recorded tray")
+    ap.add_argument("--pace", type=float, default=2.0, help="with --frames: seconds per state, more than --settle")
     args = ap.parse_args()
     if args.list:
         return list_cams()
-    if None in (args.top, args.side, args.diag):
-        raise SystemExit("give --top, --side and --diag camera indices (python capture.py --list)")
+    if args.frames and args.pace <= args.settle:
+        raise SystemExit("--pace must be more than --settle, or no state stays still long enough to be captured")
+    if not args.frames and None in (args.top, args.side, args.diag):
+        raise SystemExit("give --top, --side and --diag camera indices (python capture.py --list), or --frames")
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     models, table = load_models(args.models, dev), json.loads(Path("slots_sim.json").read_text())
     ref_empty = cv2.imread("ref_side_empty.png")
-    caps = {cam: open_cam(i, SIZES[cam], args.settings) for cam, i in (("top", args.top), ("side", args.side), ("diag", args.diag))}
+    if args.frames:
+        t0 = time.monotonic()  # one clock, so the three streams switch states together
+        caps = {cam: FolderCam(args.frames, cam, args.tray, args.pace, t0) for cam in SIZES}
+    else:
+        caps = {cam: open_cam(i, SIZES[cam], args.settings) for cam, i in (("top", args.top), ("side", args.side), ("diag", args.diag))}
     for cam, cap in caps.items():
         w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         if (w, h) != SIZES[cam]:
