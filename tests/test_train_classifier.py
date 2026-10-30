@@ -5,10 +5,44 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.classifier_utils import load_manifest, select_tau, write_probability_csv
+from scripts.classifier_utils import (
+    data_loader_options,
+    load_manifest,
+    load_rgb_images,
+    select_tau,
+    write_probability_csv,
+)
 
 
 class ClassifierUtilityTests(unittest.TestCase):
+    def test_zero_worker_loader_options_avoid_multiprocessing_settings(self) -> None:
+        options = data_loader_options(batch_size=128, workers=0, use_cuda=False)
+
+        self.assertEqual(options, {"batch_size": 128, "num_workers": 0})
+        self.assertNotIn("persistent_workers", options)
+        self.assertNotIn("prefetch_factor", options)
+        self.assertNotIn("pin_memory", options)
+
+    def test_cuda_loader_options_enable_pinned_memory(self) -> None:
+        options = data_loader_options(batch_size=64, workers=2, use_cuda=True)
+
+        self.assertEqual(options["num_workers"], 2)
+        self.assertIs(options["pin_memory"], True)
+
+    def test_load_rgb_images_decodes_crops_once(self) -> None:
+        from PIL import Image
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        image_path = Path(temporary_directory.name) / "crop.png"
+        Image.new("RGB", (80, 90), (10, 20, 30)).save(image_path)
+
+        images = load_rgb_images([{"absolute_path": str(image_path)}])
+
+        image_path.unlink()
+        self.assertEqual(images[0].size, (80, 90))
+        self.assertEqual(images[0].getpixel((0, 0)), (10, 20, 30))
+
     def test_load_manifest_filters_split_and_resolves_paths(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)

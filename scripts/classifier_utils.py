@@ -14,6 +14,34 @@ PASS_INDEX = 0
 NO_VIAL_INDEX = 4
 
 
+def data_loader_options(
+    batch_size: int, workers: int, use_cuda: bool
+) -> dict[str, int | bool]:
+    """Build safe DataLoader options without multiprocessing-only settings."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if workers < 0:
+        raise ValueError("workers must be non-negative")
+    options: dict[str, int | bool] = {
+        "batch_size": batch_size,
+        "num_workers": workers,
+    }
+    if use_cuda:
+        options["pin_memory"] = True
+    return options
+
+
+def load_rgb_images(rows: Sequence[dict[str, str]]):
+    """Decode all manifest crops once so epochs do not reread image files."""
+    from PIL import Image
+
+    images = []
+    for row in rows:
+        with Image.open(row["absolute_path"]) as image:
+            images.append(image.convert("RGB"))
+    return images
+
+
 def load_manifest(
     data_root: Path,
     split: str,

@@ -26,6 +26,8 @@ try:
         PASS_INDEX,
         binary_defect_predictions,
         binary_numbers,
+        data_loader_options,
+        load_rgb_images,
         load_manifest,
         select_tau,
         separate_no_vial_predictions,
@@ -45,6 +47,8 @@ except ModuleNotFoundError:
         PASS_INDEX,
         binary_defect_predictions,
         binary_numbers,
+        data_loader_options,
+        load_rgb_images,
         load_manifest,
         select_tau,
         separate_no_vial_predictions,
@@ -71,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--img-size", type=int, default=IMAGE_SIZE)
     parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--workers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -110,15 +115,14 @@ class CropDataset(Dataset):
     def __init__(self, rows: Sequence[dict[str, str]], transform) -> None:
         self.rows = list(rows)
         self.transform = transform
+        self.images = load_rgb_images(self.rows)
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int, int]:
         row = self.rows[index]
-        with Image.open(row["absolute_path"]) as image:
-            image = image.convert("RGB")
-            tensor = self.transform(image)
+        tensor = self.transform(self.images[index].copy())
         return tensor, CLASS_NAMES.index(row["label"]), index
 
 
@@ -282,6 +286,8 @@ def main() -> None:
     args = parse_args()
     if args.epochs < 1 or args.img_size < 1 or args.batch < 1:
         raise ValueError("--epochs, --img-size, and --batch must be positive")
+    if args.workers < 0:
+        raise ValueError("--workers must be non-negative")
     seed_everything(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -292,13 +298,19 @@ def main() -> None:
     train_dataset = CropDataset(train_rows, train_transform)
     validation_dataset = CropDataset(validation_rows, evaluation_transform)
     test_dataset = CropDataset(test_rows, evaluation_transform)
+    cached_bytes = sum(
+        image.width * image.height * len(image.getbands())
+        for dataset in (train_dataset, validation_dataset, test_dataset)
+        for image in dataset.images
+    )
+    print(
+        f"cached_crops={len(train_dataset) + len(validation_dataset) + len(test_dataset)} "
+        f"decoded_mib={cached_bytes / (1024 * 1024):.1f}",
+        flush=True,
+    )
     generator = torch.Generator().manual_seed(args.seed)
     use_cuda = torch.cuda.is_available()
-    loader_options = {
-        "batch_size": args.batch,
-        "num_workers": 4,
-        "pin_memory": use_cuda,
-    }
+    loader_options = data_loader_options(args.batch, args.workers, use_cuda)
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -309,8 +321,7 @@ def main() -> None:
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_options)
 
     device = torch.device("cuda" if use_cuda else "cpu")
-    weights = models.ResNet18_Weights.DEFAULT
-    model = models.resnet18(weights=weights)
+    model = models.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, len(CLASS_NAMES))
     model.to(device)
     loss_function = nn.CrossEntropyLoss(
@@ -435,6 +446,7 @@ def main() -> None:
     )
     model_card = {
         "architecture": "torchvision_resnet18",
+        "pretrained_weights": None,
         "class_order": list(CLASS_NAMES),
         "image_size": [args.img_size, args.img_size],
         "normalization": {"mean": list(IMAGENET_MEAN), "std": list(IMAGENET_STD)},
