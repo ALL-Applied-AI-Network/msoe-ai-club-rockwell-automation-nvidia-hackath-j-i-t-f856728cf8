@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 import json
 import math
 import random
@@ -12,7 +13,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
@@ -76,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", type=int, default=IMAGE_SIZE)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--domain-aug", action="store_true")
     return parser.parse_args()
 
 
@@ -111,6 +113,69 @@ class GaussianNoise:
         )
 
 
+class WarmYellowCreamShift:
+    """Bias RGB crops toward warm, yellow-cream factory lighting."""
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        array = np.asarray(image.convert("RGB"), dtype=np.float32)
+        array[..., 0] *= random.uniform(1.00, 1.18)
+        array[..., 1] *= random.uniform(1.00, 1.12)
+        array[..., 2] *= random.uniform(0.72, 1.00)
+        cream = np.asarray((255.0, 244.0, 190.0), dtype=np.float32)
+        blend = random.uniform(0.0, 0.16)
+        array = array * (1.0 - blend) + cream * blend
+        return Image.fromarray(np.clip(array, 0, 255).astype(np.uint8), "RGB")
+
+
+class RandomBrightRegionOverexposure:
+    def __init__(self, probability: float = 0.5) -> None:
+        self.probability = probability
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() >= self.probability:
+            return image
+        array = np.asarray(image.convert("RGB"), dtype=np.float32)
+        luminance = array.mean(axis=2)
+        threshold = random.uniform(150.0, 225.0)
+        softness = random.uniform(15.0, 45.0)
+        mask = np.clip((luminance - threshold) / softness, 0.0, 1.0)[..., None]
+        strength = random.uniform(0.25, 0.75)
+        array += (255.0 - array) * mask * strength
+        return Image.fromarray(np.clip(array, 0, 255).astype(np.uint8), "RGB")
+
+
+class RandomJPEGCompression:
+    def __init__(self, minimum_quality: int = 40, maximum_quality: int = 95) -> None:
+        self.minimum_quality = minimum_quality
+        self.maximum_quality = maximum_quality
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        buffer = BytesIO()
+        image.convert("RGB").save(
+            buffer,
+            format="JPEG",
+            quality=random.randint(self.minimum_quality, self.maximum_quality),
+        )
+        buffer.seek(0)
+        with Image.open(buffer) as compressed:
+            return compressed.convert("RGB")
+
+
+class RandomBackgroundContrast:
+    """Change contrast mainly outside saturated yellow cap pixels."""
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        source = image.convert("RGB")
+        contrasted = ImageEnhance.Contrast(source).enhance(random.uniform(0.55, 1.55))
+        array = np.asarray(source, dtype=np.float32)
+        adjusted = np.asarray(contrasted, dtype=np.float32)
+        red, green, blue = array[..., 0], array[..., 1], array[..., 2]
+        yellow_cap = (red > 120.0) & (green > 100.0) & (blue < 0.82 * green)
+        background = (~yellow_cap)[..., None]
+        result = np.where(background, adjusted, array)
+        return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), "RGB")
+
+
 class CropDataset(Dataset):
     def __init__(self, rows: Sequence[dict[str, str]], transform) -> None:
         self.rows = list(rows)
@@ -126,9 +191,37 @@ class CropDataset(Dataset):
         return tensor, CLASS_NAMES.index(row["label"]), index
 
 
-def build_transforms(image_size: int):
-    train_transform = transforms.Compose(
-        [
+def build_transforms(image_size: int, domain_aug: bool = False):
+    if domain_aug:
+        train_operations = [
+            transforms.Resize((image_size, image_size)),
+            transforms.ColorJitter(
+                brightness=0.6,
+                contrast=0.6,
+                saturation=0.6,
+                hue=0.08,
+            ),
+            WarmYellowCreamShift(),
+            RandomGamma(minimum=0.65, maximum=1.50),
+            transforms.RandomAffine(
+                degrees=2.0,
+                translate=(15.0 / image_size, 15.0 / image_size),
+                scale=(0.90, 1.10),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+            ),
+            RandomBrightRegionOverexposure(),
+            transforms.RandomApply(
+                [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))],
+                p=0.5,
+            ),
+            RandomJPEGCompression(minimum_quality=40, maximum_quality=95),
+            RandomBackgroundContrast(),
+            transforms.ToTensor(),
+            GaussianNoise(standard_deviation=0.04),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    else:
+        train_operations = [
             transforms.Resize((image_size, image_size)),
             transforms.ColorJitter(
                 brightness=0.5,
@@ -151,7 +244,7 @@ def build_transforms(image_size: int):
             GaussianNoise(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
-    )
+    train_transform = transforms.Compose(train_operations)
     evaluation_transform = build_evaluation_transform(image_size)
     return train_transform, evaluation_transform
 
@@ -294,7 +387,9 @@ def main() -> None:
     train_rows = load_manifest(args.data, "train", args.manifest)
     validation_rows = load_manifest(args.data, "val", args.manifest)
     test_rows = load_manifest(args.data, "test", args.manifest)
-    train_transform, evaluation_transform = build_transforms(args.img_size)
+    train_transform, evaluation_transform = build_transforms(
+        args.img_size, domain_aug=args.domain_aug
+    )
     train_dataset = CropDataset(train_rows, train_transform)
     validation_dataset = CropDataset(validation_rows, evaluation_transform)
     test_dataset = CropDataset(test_rows, evaluation_transform)
@@ -447,6 +542,7 @@ def main() -> None:
     model_card = {
         "architecture": "torchvision_resnet18",
         "pretrained_weights": None,
+        "domain_augmentation": args.domain_aug,
         "class_order": list(CLASS_NAMES),
         "image_size": [args.img_size, args.img_size],
         "normalization": {"mean": list(IMAGENET_MEAN), "std": list(IMAGENET_STD)},

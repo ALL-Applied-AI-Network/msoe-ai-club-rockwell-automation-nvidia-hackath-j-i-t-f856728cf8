@@ -60,7 +60,7 @@ Inspect `../factory-runtime/checks/camera_check.png`. The full G fixture must be
 
 ## Define slots
 
-The checked-in `slots_G.json` is the default for the calibrated 1920x1080 `view_001` top view. Use it unchanged only when its overlay boxes align with the physical G fixture.
+The checked-in `slots_G.json` was clicked on the real 1920x1080 factory camera view. The factory tray and camera are fixed; use this file unchanged while that geometry remains fixed and its overlay boxes align with the physical G fixture.
 
 If the camera, lens, zoom, tray, or fixture moves, redefine the slots from a current reference image:
 
