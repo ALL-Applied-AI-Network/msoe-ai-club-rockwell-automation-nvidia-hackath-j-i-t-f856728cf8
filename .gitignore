@@ -53,6 +53,7 @@ dataset*/
 data_sim/
 frames/
 live_frames/
+live_videos/
 models/
 ref_side_empty.png
 cam_*.png

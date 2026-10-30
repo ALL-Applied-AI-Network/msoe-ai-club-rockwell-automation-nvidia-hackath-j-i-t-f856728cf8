@@ -50,7 +50,7 @@ python -c "import torch; print(torch.cuda.get_device_name(0))"   # NVIDIA GB10
   - the training trays take about 80 s;
   - R2 takes about 20 s per epoch, about 20 min for all three models.
 - **Don't run the scripts with the system `python3`, outside the venv.** Its torch 2.5.1 has no kernels for the GB10 (sm_121) but still reports CUDA as available, so the scripts crash with `CUDA error: no kernel image is available for execution on the device`.
-- **Steps 5–6.** Do them on the laptop. Step 5 needs a display, and `capture.py` opens cameras through DirectShow, which only exists on Windows.
+- **Steps 5–6.** Step 5 works on the Spark, but it saves the dashboard as a video because the Spark has no display. Do step 6 on the laptop: `capture.py` opens cameras through DirectShow, which only exists on Windows.
 
 ### Step 2. Put in place the files git doesn't have
 
@@ -125,7 +125,7 @@ python infer.py dataset_v1_partial/dataset_v1_partial --episodes $(printf 'train
 
 On the training trays, a correct run gives 778/780 (class and good-vs-bad accuracy 0.997). The two misses are known: in `train_0008 k28` and `train_0017 k28`, a good cap at rise +7.4 px is called `raised_cap`. That is the tight margin in [Thresholds](#thresholds).
 
-### Step 5. Replay a recorded tray (needs a display)
+### Step 5. Replay a recorded tray
 
 ```bash
 python live.py dataset_v1_partial/dataset_v1_partial/frames train_0031 --pace 1
@@ -145,6 +145,17 @@ train_0031 done: {'raised_cap': 5, 'pass': 15, 'no_vial': 2, 'crooked_cap': 5, '
 ```
 
 `side -` or `45deg -` in place of the numbers means that camera saw nothing new. The last view stays up until you press Esc or close the window.
+
+**On the Spark, or any Linux machine with no display,** the same command opens no window and saves the dashboard as a video:
+- **What it prints:** first `no display: saving each tray's dashboard to live_videos/<tray>.mp4 ...`, then the same step lines, then `dashboard video -> live_videos/train_0031.mp4`.
+- **Speed:** it runs at full speed; on the Spark GPU that is about 35 ms per step.
+- **The video:** one frame per step (1120×720), played back at one step per `--pace` seconds, or 1 s without `--pace`. `--videos <dir>` saves to another folder.
+
+To watch it, copy it to the laptop by running this on the laptop:
+
+```bash
+scp yt-jit3783@172.30.102.95:/home/yt-jit3783/workspace/hackathon/live_videos/train_0031.mp4 .
+```
 
 ### Step 6. Live USB cameras (Windows only, needs a display)
 
@@ -267,6 +278,7 @@ These are the constants at the top of `infer.py`, picked on the 26 training tray
 | `data_sim/{train,val}/<class>/` | no | `prep.py` | `train.py` |
 | `models/{cap,vial,empty}.pt` | no | `train.py` | `infer.py`, `live.py` |
 | `live_frames/{top,side,diag}/` | no | `capture.py` | `live.py` |
+| `live_videos/<tray>.mp4` | no | `live.py` on a machine with no display | you, to watch the dashboard |
 | `cam_<i>.png` | no | `capture.py --list` | you, to identify the cameras |
 
 - **Keep `slots_sim.json` and `ref_side_empty.png` together.** `side_ref_skyline` in the JSON was measured on that exact PNG, so regenerate both or neither.
@@ -299,6 +311,7 @@ Write each file atomically: write a temp file, then rename it, as `capture.save`
 | Many `check` verdicts across one tray | The side camera moved more than about ±6 px, or `ref_side_empty.png` doesn't match `slots_sim.json` | Regenerate both with R1. In step 5, check that the cyan skyline sits on the cap tops. |
 | `raised_cap` on good caps | Rise is near the 6.5 px limit; good caps reach about +6 | Read the rise values with `-v`. Fix the camera before touching `RISE_HIGH`. |
 | `crooked_cap` and `raised_cap` mixed up | The 45° view missed the cap (`45deg no cap`), or the lighting moved the cap's hue | Check `upright.CAP_HSV`: hue 23–30; the robot arm is near 20 |
+| `qt.qpa.xcb: could not connect to display` then `Aborted (core dumped)` from `live.py` | `DISPLAY` is set, but no X server answers (for example `ssh -X` without an X server on the laptop) | `unset DISPLAY` and rerun; `live.py` then saves a video (step 5) |
 | `camera N didn't open` | Wrong index, or not on Windows | `python capture.py --list` on Windows |
 | `live.py` prints nothing, then `no empty-tray frames <tray>_s00.png under ...` after 60 s | That tray's `s00` is missing from one of `top/`, `side/`, `diag/` | Make sure all three files exist; `--timeout` waits longer |
 | `python live.py live_frames` shows nothing | No `*_s00.png` in `live_frames/top/` yet; it waits without printing | Start `capture.py` first |

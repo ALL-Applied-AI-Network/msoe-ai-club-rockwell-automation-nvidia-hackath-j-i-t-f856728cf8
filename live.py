@@ -5,10 +5,13 @@ state 00 is the empty tray, state k has vials 1..k (vial k went into slot k, fil
 
 python live.py dataset_v1_partial/dataset_v1_partial/frames train_0031 --pace 1   # replay a recorded tray, 1 s a step
 python live.py live_frames                    # follow capture.py: newest tray, then each new one as it starts
-Esc closes the window.
+Esc closes the window. With no display (the Spark over ssh) there is no window: each tray's dashboard is saved as
+live_videos/<tray>.mp4 instead (--videos), one frame per step.
 """
 import argparse
 import json
+import os
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -23,6 +26,15 @@ from skyline import episode_skyline
 CAMS = ("top", "side", "diag")
 WIN = "vial check"
 GREEN, GREY, ORANGE, RED, CYAN = (0, 200, 0), (150, 150, 150), (0, 165, 255), (0, 0, 255), (255, 255, 0)  # BGR
+HEADLESS = sys.platform.startswith("linux") and not os.environ.get("DISPLAY")  # cv2.imshow would abort here
+
+
+def pause(ms):
+    """cv2.waitKey keeps the window responsive and returns the key; with no display there's no window, so just sleep."""
+    if HEADLESS:
+        time.sleep(ms / 1000)
+        return -1
+    return cv2.waitKey(ms)
 
 
 def colour(verdict):
@@ -38,7 +50,7 @@ def wait_for_state(frames, tray, s, timeout):
             imgs = {cam: cv2.imread(str(p)) for cam, p in paths.items()}
             if all(im is not None for im in imgs.values()):
                 return imgs
-        cv2.waitKey(200)  # keeps the window responsive while we wait
+        pause(200)
     return None
 
 
@@ -89,33 +101,46 @@ def follow(frames):
             last = new[-1] if last is None else new[0]
             yield last
         else:
-            cv2.waitKey(500)
+            pause(500)
 
 
-def run_tray(frames, tray, models, table, ref_empty, dev, pace, timeout):
-    """Check one tray state by state as its frames land. False if Esc was pressed."""
+def run_tray(frames, tray, models, table, ref_empty, dev, pace, timeout, videos=None):
+    """Check one tray state by state as its frames land. False if Esc was pressed.
+    videos: folder to save the dashboard to as <tray>.mp4 instead of showing it (no display)."""
     before = wait_for_state(frames, tray, 0, timeout)
     if before is None:
         print(f"no empty-tray frames {tray}_s00.png under {frames}/{{top,side,diag}}")
         return True
     print(f"--- {tray}")
     sky = episode_skyline(before["side"], ref_empty, table["side_ref_skyline"])
-    verdicts = {}
-    for k in range(1, 31):
-        after = wait_for_state(frames, tray, k, timeout)
-        if after is None:
-            print(f"no state {k} within {timeout:.0f} s, stopping this tray")
-            break
-        t0 = time.perf_counter()
-        verdicts[k], p, side, tilt = check_step(k, before, after, sky, models, table, dev)
-        ms = (time.perf_counter() - t0) * 1000
-        print(f"G{k:02d} {verdicts[k]:<12} cap {p['cap']:.2f} vial {p['vial']:.2f} empty {p['empty']:.2f}  "
-              + ("side -" if side is None else f"rise {side[0]:+.1f} dome {side[1]:.2f}")
-              + ("  45deg -" if tilt is None else f"  tilt {tilt:.3f}") + f"  ({ms:.0f} ms)")
-        cv2.imshow(WIN, dashboard(k, after, verdicts, p, side, tilt, sky, table, ms))
-        if cv2.waitKey(max(1, int(pace * 1000))) == 27:
-            return False
-        before = after
+    verdicts, video = {}, None
+    try:
+        for k in range(1, 31):
+            after = wait_for_state(frames, tray, k, timeout)
+            if after is None:
+                print(f"no state {k} within {timeout:.0f} s, stopping this tray")
+                break
+            t0 = time.perf_counter()
+            verdicts[k], p, side, tilt = check_step(k, before, after, sky, models, table, dev)
+            ms = (time.perf_counter() - t0) * 1000
+            print(f"G{k:02d} {verdicts[k]:<12} cap {p['cap']:.2f} vial {p['vial']:.2f} empty {p['empty']:.2f}  "
+                  + ("side -" if side is None else f"rise {side[0]:+.1f} dome {side[1]:.2f}")
+                  + ("  45deg -" if tilt is None else f"  tilt {tilt:.3f}") + f"  ({ms:.0f} ms)")
+            view = dashboard(k, after, verdicts, p, side, tilt, sky, table, ms)
+            if videos:
+                if video is None:  # one frame per step, played back at one step per --pace seconds
+                    video = cv2.VideoWriter(str(videos / f"{tray}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
+                                            1 / pace if pace else 1, view.shape[1::-1])
+                video.write(view)
+            else:
+                cv2.imshow(WIN, view)
+                if cv2.waitKey(max(1, int(pace * 1000))) == 27:
+                    return False
+            before = after
+    finally:
+        if video is not None:
+            video.release()  # also on Ctrl+C: an unfinished .mp4 won't play
+            print(f"dashboard video -> {videos / tray}.mp4")
     print(f"{tray} done:", dict(Counter(verdicts.values())))
     return True
 
@@ -127,20 +152,27 @@ def main():
     ap.add_argument("--pace", type=float, default=0, help="minimum seconds per step (slow down a replay)")
     ap.add_argument("--timeout", type=float, default=60, help="seconds to wait for the next state before giving up")
     ap.add_argument("--models", default="models")
+    ap.add_argument("--videos", default="live_videos", help="with no display: folder for the <tray>.mp4 dashboards")
     args = ap.parse_args()
     frames = Path(args.frames)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     models, table = load_models(args.models, dev), json.loads(Path("slots_sim.json").read_text())
     ref_empty = cv2.imread("ref_side_empty.png")
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    videos = Path(args.videos) if HEADLESS else None
+    if videos:
+        videos.mkdir(parents=True, exist_ok=True)
+        print(f"no display: saving each tray's dashboard to {videos}/<tray>.mp4 instead of opening a window")
+    else:
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 
     for tray in [args.tray] if args.tray else follow(frames):
-        if not run_tray(frames, tray, models, table, ref_empty, dev, args.pace, args.timeout):
+        if not run_tray(frames, tray, models, table, ref_empty, dev, args.pace, args.timeout, videos):
             break
     else:  # single tray finished: keep the last view up until the window is closed or Esc
-        while cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) >= 1 and cv2.waitKey(100) != 27:
+        while not videos and cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) >= 1 and cv2.waitKey(100) != 27:
             pass
-    cv2.destroyAllWindows()
+    if not videos:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
