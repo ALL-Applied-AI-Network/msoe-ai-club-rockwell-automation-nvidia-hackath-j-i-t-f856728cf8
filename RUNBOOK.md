@@ -32,11 +32,24 @@ pip install opencv-python==5.0.0.93 pillow==12.3.0 numpy==2.4.6
 python -c "import torch; print(torch.cuda.is_available())"   # True. False still works, only slower (CPU).
 ```
 
-**On the DGX Spark** (Linux aarch64, GB10):
+**On the DGX Spark** (Linux aarch64, GB10, Python 3.12):
 - **Checkout.** It is at `/home/yt-jit3783/workspace/hackathon`; connect with `ssh yt-jit3783@172.30.102.95` over the CSI VPN. That checkout has no GitHub login, so `git pull` there fails; copy files over from the laptop instead.
-- **Python.** Use the system `python3` (3.12, torch 2.5.1, OpenCV 4.6), and type `python3` wherever this file says `python`.
-- **GPU.** That torch build has no kernels for the GB10 (sm_121), but it still reports CUDA as available, so the scripts crash with `CUDA error: no kernel image is available for execution on the device`. Run them on the CPU by putting `CUDA_VISIBLE_DEVICES=` in front, for example `CUDA_VISIBLE_DEVICES= python3 infer.py dataset_v1_partial/dataset_v1_partial`. Step 4 then takes 30–55 s, and the training trays about 3 min.
-- **Training.** R2 works on the CPU but takes about 2.5 min per epoch. All three models at the default 20 epochs take about 2.5 hours. Training on the GPU needs a torch build that supports sm_121.
+- **venv.** It uses the same pinned versions as the laptop. The cu128 torch build ships sm_120 GPU kernels, which run on the GB10. The venv is already set up there; redo the first four lines below only if the workspace was wiped.
+
+```bash
+cd /home/yt-jit3783/workspace/hackathon
+python3 -m venv .venv
+source .venv/bin/activate             # every new terminal
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+pip install opencv-python==5.0.0.93 pillow==12.3.0 numpy==2.4.6
+python -c "import torch; print(torch.cuda.get_device_name(0))"   # NVIDIA GB10
+```
+
+- **Running.** With the venv active, every command in this file works as written. On the Spark GPU:
+  - step 4 takes about 15 s;
+  - the training trays take about 80 s;
+  - R2 takes about 20 s per epoch, about 20 min for all three models.
+- **Don't run the scripts with the system `python3`, outside the venv.** Its torch 2.5.1 has no kernels for the GB10 (sm_121) but still reports CUDA as available, so the scripts crash with `CUDA error: no kernel image is available for execution on the device`.
 - **Steps 5–6.** Do them on the laptop. Step 5 needs a display, and `capture.py` opens cameras through DirectShow, which only exists on Windows.
 
 ### Step 2. Put in place the files git doesn't have
@@ -276,9 +289,9 @@ Write each file atomically: write a temp file, then rename it, as `capture.save`
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `ModuleNotFoundError: No module named 'torch'` (or `cv2`) | The venv isn't active | `source .venv/Scripts/activate` |
-| `RuntimeError: CUDA error: no kernel image is available for execution on the device` | On the Spark: its torch 2.5.1 can't run on the GB10 GPU | Put `CUDA_VISIBLE_DEVICES=` in front of the command to use the CPU (step 1) |
-| `ImportError: ... libwebpmux.so.3: undefined symbol: WebPMalloc` | On the Spark: `torchvision` (or PIL) was imported before `cv2` | Import `cv2` first. The repo's scripts already do; this only bites new code and one-liners. |
+| `ModuleNotFoundError: No module named 'torch'` (or `cv2`) | The venv isn't active | `source .venv/Scripts/activate` (on the Spark: `source .venv/bin/activate`) |
+| `RuntimeError: CUDA error: no kernel image is available for execution on the device` | On the Spark: run with the system `python3`, whose torch 2.5.1 can't use the GB10 | `source .venv/bin/activate` (step 1) |
+| `ImportError: ... libwebpmux.so.3: undefined symbol: WebPMalloc` | On the Spark, outside the venv: the system `torchvision` was imported before `cv2` | `source .venv/bin/activate`; the venv's packages don't have this problem |
 | `FileNotFoundError` for `models\cap.pt` or `slots_sim.json` | Not run from the repo root, or there are no models yet | `cd` to the repo root; step 2 or R2 |
 | `cv2.error: ... !_src.empty() in function 'cvtColor'` in `skyline.episode_skyline` | `ref_side_empty.png` is missing from the current folder | Step 2 |
 | `train.py`: `unknown class folders {...}` | Extra folder under `data_sim/train/` or `data_sim/val/` | Re-run R1. Allowed folders: `pass raised_cap crooked_cap missing_cap no_vial empty`. |
