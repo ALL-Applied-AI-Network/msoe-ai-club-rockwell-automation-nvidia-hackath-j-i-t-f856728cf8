@@ -76,6 +76,65 @@ def separate_no_vial_predictions(probabilities) -> list[int]:
     return predictions
 
 
+def write_probability_csv(
+    path: Path,
+    rows: Sequence[dict[str, str]],
+    probabilities,
+    targets,
+    indices,
+) -> None:
+    """Write per-sample class probabilities in dataset-inference order."""
+    probability_rows = _as_rows(probabilities)
+    target_rows = _as_targets(targets)
+    index_rows = _as_targets(indices)
+    predictions = separate_no_vial_predictions(probability_rows)
+    probability_fields = [f"p_{name}" for name in CLASS_NAMES]
+    fieldnames = [
+        "path",
+        "label",
+        "job",
+        "image_id",
+        "slot",
+        "damage_type",
+        "target_class",
+        "predicted_class",
+        *probability_fields,
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for probability_row, target, index, prediction in zip(
+            probability_rows,
+            target_rows,
+            index_rows,
+            predictions,
+            strict=True,
+        ):
+            manifest_row = rows[index]
+            output_row = {
+                field: manifest_row.get(field, "")
+                for field in (
+                    "path",
+                    "label",
+                    "job",
+                    "image_id",
+                    "slot",
+                    "damage_type",
+                )
+            }
+            output_row["target_class"] = CLASS_NAMES[target]
+            output_row["predicted_class"] = CLASS_NAMES[prediction]
+            output_row.update(
+                {
+                    field: f"{probability:.10f}"
+                    for field, probability in zip(
+                        probability_fields, probability_row, strict=True
+                    )
+                }
+            )
+            writer.writerow(output_row)
+
+
 def binary_defect_predictions(
     probabilities, tau: float
 ) -> list[bool]:

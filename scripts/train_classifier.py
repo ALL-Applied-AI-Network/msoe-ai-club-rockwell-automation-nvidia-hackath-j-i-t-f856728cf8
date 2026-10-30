@@ -29,6 +29,7 @@ try:
         load_manifest,
         select_tau,
         separate_no_vial_predictions,
+        write_probability_csv,
     )
     from model_preprocessing import (
         IMAGE_SIZE,
@@ -47,6 +48,7 @@ except ModuleNotFoundError:
         load_manifest,
         select_tau,
         separate_no_vial_predictions,
+        write_probability_csv,
     )
     from scripts.model_preprocessing import (
         IMAGE_SIZE,
@@ -382,12 +384,17 @@ def main() -> None:
         raise RuntimeError("Training did not produce a model state")
     model.load_state_dict(best_state)
     model.to(device)
-    validation_probabilities, validation_targets, _ = infer(
+    validation_probabilities, validation_targets, validation_indices = infer(
         model, validation_loader, device
     )
     tau, validation_binary = select_tau(
         validation_probabilities, validation_targets
     )
+    validation_predictions = separate_no_vial_predictions(validation_probabilities)
+    validation_matrix = confusion_matrix(
+        validation_targets, validation_predictions, len(CLASS_NAMES)
+    )
+    validation_metrics = metrics_from_confusion(validation_matrix)
 
     test_probabilities, test_targets, test_indices = infer(model, test_loader, device)
     test_predictions = separate_no_vial_predictions(test_probabilities)
@@ -416,6 +423,11 @@ def main() -> None:
         "false_negatives_per_defect_class": false_negatives,
         "false_alarm_rate_at_tau": test_binary["false_alarm_rate"],
         "binary_defect_vs_pass": test_binary,
+        "validation": {
+            **validation_metrics,
+            "confusion_matrix": validation_matrix.tolist(),
+            "binary_defect_vs_pass": validation_binary,
+        },
         "history": history,
     }
     (args.out / "metrics.json").write_text(
@@ -441,6 +453,13 @@ def main() -> None:
     }
     (args.out / "model_card.json").write_text(
         json.dumps(model_card, indent=2) + "\n", encoding="utf-8"
+    )
+    write_probability_csv(
+        args.out / "validation_predictions.csv",
+        validation_rows,
+        validation_probabilities,
+        validation_targets,
+        validation_indices,
     )
     draw_confusion(test_matrix, args.out / "confusion.png")
     draw_false_negative_sheet(

@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.classifier_utils import load_manifest, select_tau
+from scripts.classifier_utils import load_manifest, select_tau, write_probability_csv
 
 
 class ClassifierUtilityTests(unittest.TestCase):
@@ -175,6 +175,50 @@ class ClassifierUtilityTests(unittest.TestCase):
 
         self.assertEqual(numbers["true_positive"], 1)
         self.assertEqual(numbers["false_positive"], 0)
+
+    def test_write_probability_csv_records_every_validation_probability(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        output_path = Path(temporary_directory.name) / "validation_predictions.csv"
+        rows = [
+            {
+                "path": "data/val/pass/a.png",
+                "label": "pass",
+                "job": "job-a",
+                "image_id": "a",
+                "slot": "G01",
+                "damage_type": "",
+            },
+            {
+                "path": "data/val/missing_cap/b.png",
+                "label": "missing_cap",
+                "job": "job-b",
+                "image_id": "b",
+                "slot": "G02",
+                "damage_type": "",
+            },
+        ]
+        probabilities = [
+            [0.05, 0.85, 0.04, 0.03, 0.03],
+            [0.80, 0.10, 0.04, 0.03, 0.03],
+        ]
+
+        write_probability_csv(
+            output_path,
+            rows,
+            probabilities,
+            targets=[1, 0],
+            indices=[1, 0],
+        )
+
+        with output_path.open(newline="", encoding="utf-8") as handle:
+            output_rows = list(csv.DictReader(handle))
+        self.assertEqual(len(output_rows), 2)
+        self.assertEqual(output_rows[0]["path"], rows[1]["path"])
+        self.assertEqual(output_rows[0]["target_class"], "missing_cap")
+        self.assertEqual(output_rows[0]["predicted_class"], "missing_cap")
+        self.assertEqual(output_rows[0]["p_missing_cap"], "0.8500000000")
+        self.assertEqual(output_rows[1]["p_pass"], "0.8000000000")
 
 
 if __name__ == "__main__":
