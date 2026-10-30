@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -18,7 +19,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from fill_logic import ALL_SLOT_NAMES, G_SLOT_NAMES, S_SLOT_NAMES, sample_fill_scene
+from fill_logic import (
+    ALL_SLOT_NAMES,
+    G_SLOT_NAMES,
+    QUOTA_DAMAGE_TYPES,
+    QUOTA_DEFECT_CLASSES,
+    S_SLOT_NAMES,
+    apply_quota_assignments,
+    build_golden_fill_scene,
+    build_quota_schedule,
+    sample_fill_scene,
+)
 from fisheye import (
     PRINCIPAL_POINT,
     fisheye_pixels_to_pinhole_normalized,
@@ -60,6 +71,59 @@ FLOOR_THICKNESS_M = 0.005
 DEFAULT_FLOOR_ALBEDO = (0.36, 0.31, 0.22)
 DEFAULT_FLOOR_EMISSIVE = (0.15, 0.115, 0.07)
 FLOOR_JITTER_SEED_OFFSET = 0x464C4F4F52
+QUOTA_SLOT_SEED_OFFSET = 0x51554F5441
+
+
+def parse_ordered_choices(
+    value: str,
+    allowed: tuple[str, ...],
+    option_name: str,
+) -> tuple[str, ...]:
+    """Parse a non-empty, duplicate-free comma list from an allowed set."""
+    choices = tuple(part.strip() for part in value.split(",") if part.strip())
+    invalid = [choice for choice in choices if choice not in allowed]
+    if not choices or invalid or len(set(choices)) != len(choices):
+        allowed_text = ",".join(allowed)
+        raise argparse.ArgumentTypeError(
+            f"{option_name} must be a non-empty, duplicate-free comma list from "
+            f"{allowed_text}"
+        )
+    return choices
+
+
+def parse_quota_classes(value: str) -> tuple[str, ...]:
+    return parse_ordered_choices(value, QUOTA_DEFECT_CLASSES, "--quota-classes")
+
+
+def parse_damage_types(value: str) -> tuple[str, ...]:
+    return parse_ordered_choices(value, QUOTA_DAMAGE_TYPES, "--damage-types")
+
+
+def projected_points_crop_check(
+    center_pixel,
+    tip_pixel,
+    crop_center,
+    crop_offsets,
+) -> dict[str, object]:
+    """Report whether projected tube center and tip lie inside one crop."""
+    x0 = float(crop_center[0]) + float(crop_offsets[0])
+    y0 = float(crop_center[1]) + float(crop_offsets[1])
+    x1 = float(crop_center[0]) + float(crop_offsets[2])
+    y1 = float(crop_center[1]) + float(crop_offsets[3])
+
+    def inside(point) -> bool:
+        return x0 <= float(point[0]) <= x1 and y0 <= float(point[1]) <= y1
+
+    center_inside = inside(center_pixel)
+    tip_inside = inside(tip_pixel)
+    return {
+        "center_px": [float(center_pixel[0]), float(center_pixel[1])],
+        "tip_px": [float(tip_pixel[0]), float(tip_pixel[1])],
+        "crop_rect_px": [x0, y0, x1, y1],
+        "center_inside": center_inside,
+        "tip_inside": tip_inside,
+        "inside": center_inside and tip_inside,
+    }
 
 
 def labeler_grid_center(grid, position: int) -> tuple[float, float]:
@@ -476,6 +540,57 @@ def sample_floor_emissive(
     }
 
 
+def clone_random_generator(source: random.Random) -> random.Random:
+    """Clone RNG state without advancing the source generator."""
+    clone = random.Random()
+    clone.setstate(source.getstate())
+    return clone
+
+
+def build_run_summary(image_records) -> dict[str, dict[str, object]]:
+    """Count final labels and realized damage types for each fixture."""
+    summary = {
+        prefix: {
+            "pass": 0,
+            "missing_cap": 0,
+            "crooked_cap": 0,
+            "damaged_vial": 0,
+            "damage_types": {damage_type: 0 for damage_type in QUOTA_DAMAGE_TYPES},
+            "no_vial": 0,
+        }
+        for prefix in ("G", "S")
+    }
+    for record in image_records:
+        for slot, label in record["labels"].items():
+            fixture_summary = summary[slot[0]]
+            fixture_summary[label] += 1
+            if label == "damaged_vial":
+                damage_type = record["variations"][slot]["damage"]["kind"]
+                damage_counts = fixture_summary["damage_types"]
+                damage_counts[damage_type] = damage_counts.get(damage_type, 0) + 1
+    return summary
+
+
+def print_run_summary(summary: dict[str, dict[str, object]]) -> None:
+    """Print a compact per-fixture final-label summary."""
+    print(
+        "fixture pass missing_cap crooked_cap damaged_vial "
+        "bend crush lean_crush broken_top no_vial",
+        flush=True,
+    )
+    for prefix in ("G", "S"):
+        counts = summary[prefix]
+        damage_counts = counts["damage_types"]
+        print(
+            f"{prefix} {counts['pass']} {counts['missing_cap']} "
+            f"{counts['crooked_cap']} {counts['damaged_vial']} "
+            f"{damage_counts['bend']} {damage_counts['crush']} "
+            f"{damage_counts['lean_crush']} {damage_counts['broken_top']} "
+            f"{counts['no_vial']}",
+            flush=True,
+        )
+
+
 def floor_box_spec(
     camera: dict,
     labeler_geometry: dict,
@@ -616,6 +731,43 @@ def parse_args() -> argparse.Namespace:
         "--class-balance",
         action="store_true",
         help="Force damaged, crooked-cap, and missing-cap examples per image.",
+    )
+    parser.add_argument(
+        "--quota-mode",
+        action="store_true",
+        help="Use deterministic run-level class and damage-type quotas.",
+    )
+    parser.add_argument(
+        "--quota-classes",
+        type=parse_quota_classes,
+        default=QUOTA_DEFECT_CLASSES,
+        metavar="CLASS,...",
+        help=(
+            "Quota classes from missing_cap,crooked_cap,damaged_vial "
+            "(default: all)."
+        ),
+    )
+    parser.add_argument(
+        "--damage-types",
+        type=parse_damage_types,
+        default=QUOTA_DAMAGE_TYPES,
+        metavar="TYPE,...",
+        help=(
+            "Damage types from bend,crush,lean_crush,broken_top "
+            "(default: all)."
+        ),
+    )
+    parser.add_argument(
+        "--golden",
+        action="store_true",
+        help="Render fixed all-pass, fully filled reference images.",
+    )
+    parser.add_argument(
+        "--defects-per-fixture",
+        type=int,
+        default=3,
+        metavar="K",
+        help="Exact scheduled defects per fixture per image in quota mode (default: 3).",
     )
     parser.add_argument(
         "--width-scale",
@@ -762,6 +914,12 @@ def main() -> None:
             raise ValueError("--defect-boost must be positive")
         if args.damage_weight < 0.0:
             raise ValueError("--damage-weight must be non-negative")
+        if not 0 <= args.defects_per_fixture <= 30:
+            raise ValueError("--defects-per-fixture must be from 0 to 30")
+        if args.golden and (args.quota_mode or args.class_balance):
+            print("--golden overrides --quota-mode and --class-balance", flush=True)
+        elif args.quota_mode and args.class_balance:
+            print("--quota-mode overrides --class-balance", flush=True)
         if args.light_scale is None:
             args.light_scale = default_light_scale(args.light_profile)
         if args.light_scale <= 0.0:
@@ -776,6 +934,16 @@ def main() -> None:
             raise NotImplementedError(
                 f"Camera view {args.camera_view!r} is not implemented; use 'top'"
             )
+        damage_sampler_types = (
+            DAMAGE_KINDS
+            if args.damage_types == QUOTA_DAMAGE_TYPES
+            else tuple(args.damage_types)
+        )
+        damage_weight_by_type = dict(zip(DAMAGE_KINDS, DAMAGE_WEIGHTS, strict=True))
+        damage_sampler_weights = tuple(
+            damage_weight_by_type[damage_type]
+            for damage_type in damage_sampler_types
+        )
         ensure_external_output(args.out)
 
         import cv2
@@ -1647,15 +1815,81 @@ def main() -> None:
                 limit = min(limit, max(0.0, entry))
             return limit
 
-        def sample_damage_plan(name, labels, scene_rng, defect_boost):
+        def damage_crop_projection(name, plan, crop_context):
+            tube = slot_info[name]["tube"]
+            center = (tube["minimum"] + tube["maximum"]) / 2.0
+            tip = np.array(
+                [center[0], center[1], tube["maximum"][2]],
+                dtype=np.float64,
+            )
+            direction = np.asarray(plan["direction"], dtype=np.float64)
+            kind = plan["kind"]
+            if kind in ("crush", "lean_crush"):
+                shift = float(plan["band_shift_m"]) * direction
+                center[:2] += shift
+                tip[:2] += shift
+            elif kind == "bend":
+                center[:2] += 0.25 * float(plan["amplitude"]) * direction
+                tip[:2] += float(plan["amplitude"]) * direction
+            elif kind == "broken_top":
+                tube_height = float(tube["maximum"][2] - tube["minimum"][2])
+                tip[2] = tube["minimum"][2] + (
+                    1.0 - float(plan["hidden_fraction"])
+                ) * tube_height
+
+            transform = crop_context["pre_damage_matrix"]
+            if kind == "lean_crush":
+                base_center = np.array(
+                    [
+                        (tube["minimum"][0] + tube["maximum"][0]) / 2.0,
+                        (tube["minimum"][1] + tube["maximum"][1]) / 2.0,
+                        tube["minimum"][2],
+                    ]
+                )
+                lean_axis = (-direction[1], direction[0], 0.0)
+                transform = transform * about(
+                    base_center,
+                    rotation(lean_axis, plan["tilt_degrees"]),
+                )
+
+            center_world = transform.Transform(Gf.Vec3d(*center))
+            tip_world = transform.Transform(Gf.Vec3d(*tip))
+            center_pixel = project(
+                center_world,
+                crop_context["cv_rotation"],
+                crop_context["cv_position"],
+            )
+            tip_pixel = project(
+                tip_world,
+                crop_context["cv_rotation"],
+                crop_context["cv_position"],
+            )
+            return projected_points_crop_check(
+                center_pixel,
+                tip_pixel,
+                crop_context["crop_center"],
+                crop_context["crop_offsets"],
+            )
+
+        def sample_damage_plan(
+            name,
+            labels,
+            scene_rng,
+            defect_boost,
+            forced_kind=None,
+            crop_context=None,
+        ):
+            if forced_kind is not None and forced_kind not in damage_sampler_types:
+                raise ValueError(f"Unknown forced damage kind: {forced_kind!r}")
             tube = slot_info[name]["tube"]
             tube_height = max(
                 float(tube["maximum"][2] - tube["minimum"][2]), 1.0e-6
             )
             for attempt in range(MAX_DAMAGE_ATTEMPTS):
-                kind = scene_rng.choices(
-                    DAMAGE_KINDS, weights=DAMAGE_WEIGHTS, k=1
+                sampled_kind = scene_rng.choices(
+                    damage_sampler_types, weights=damage_sampler_weights, k=1
                 )[0]
+                kind = forced_kind if forced_kind is not None else sampled_kind
                 direction = candidate_direction(name, labels, scene_rng, attempt)
                 safe_shift = maximum_safe_shift(name, labels, direction)
                 plan = {
@@ -1704,6 +1938,16 @@ def main() -> None:
                             strength=tilt_degrees,
                             crush_strength=1.0 - radius_scale,
                         )
+                        crop_check = damage_crop_projection(
+                            name, plan, crop_context
+                        )
+                        if not crop_check["inside"]:
+                            continue
+                        plan["crop_check"] = crop_check
+                    else:
+                        plan["crop_check"] = damage_crop_projection(
+                            name, plan, crop_context
+                        )
                     return plan
                 if kind == "bend":
                     amplitude = min(
@@ -1713,12 +1957,18 @@ def main() -> None:
                     if amplitude < MIN_BEND_SHIFT_M:
                         continue
                     plan.update(amplitude=amplitude, strength=amplitude)
+                    plan["crop_check"] = damage_crop_projection(
+                        name, plan, crop_context
+                    )
                     return plan
                 hidden_fraction = scene_rng.uniform(0.30, 0.50)
                 plan.update(
                     hidden_fraction=hidden_fraction,
                     cap_tilt_degrees=scene_rng.uniform(10.0, 20.0),
                     strength=hidden_fraction,
+                )
+                plan["crop_check"] = damage_crop_projection(
+                    name, plan, crop_context
                 )
                 return plan
             return None
@@ -1874,7 +2124,14 @@ def main() -> None:
             )
             return mouth_shift, mouth_tilt
 
-        def apply_slot(name, labels, scene_rng, defect_boost):
+        def apply_slot(
+            name,
+            labels,
+            scene_rng,
+            defect_boost,
+            forced_damage_kind=None,
+            crop_context=None,
+        ):
             label = labels[name]
             record = slot_info[name]
             tube = record["tube"]
@@ -1949,8 +2206,15 @@ def main() -> None:
                 )
                 variation["crooked_tilt_deg"] = crooked_degrees
             elif label == "damaged_vial":
+                damage_crop_context = dict(crop_context)
+                damage_crop_context["pre_damage_matrix"] = lean_matrix
                 plan = sample_damage_plan(
-                    name, labels, scene_rng, defect_boost
+                    name,
+                    labels,
+                    scene_rng,
+                    defect_boost,
+                    forced_kind=forced_damage_kind,
+                    crop_context=damage_crop_context,
                 )
                 if plan is None:
                     labels[name] = "pass"
@@ -2088,6 +2352,38 @@ def main() -> None:
                 "enable_color_temperature": True,
             }
 
+        def set_golden_light(light_record):
+            sample = {
+                "profile": "golden",
+                "intensity_factor": 1.0,
+                "intensity_scale": float(args.light_scale),
+                "intensity_multiplier": float(args.light_scale),
+                "color_temperature_k": 6500.0,
+                "color_rgb": [1.0, 1.0, 1.0],
+                "position_jitter_m": [0.0, 0.0, 0.0],
+            }
+            prim = light_record["prim"]
+            intensity = light_record["base_intensity"] * args.light_scale
+            prim.GetAttribute("inputs:intensity").Set(intensity)
+            color_attribute = prim.GetAttribute("inputs:color")
+            if not color_attribute.IsValid():
+                raise RuntimeError(
+                    f"Golden mode requires inputs:color on {prim.GetPath()}"
+                )
+            color_attribute.Set(Gf.Vec3f(1.0, 1.0, 1.0))
+            light_api = UsdLux.LightAPI(prim)
+            light_api.CreateEnableColorTemperatureAttr(True).Set(True)
+            light_api.CreateColorTemperatureAttr(6500.0).Set(6500.0)
+            light_record["transform_op"].Set(
+                light_record["world"] * light_record["parent_inverse"]
+            )
+            return {
+                **sample,
+                "base_intensity": light_record["base_intensity"],
+                "intensity": intensity,
+                "enable_color_temperature": True,
+            }
+
         def write_crop(image, center, offsets, path):
             center_x = int(round(center[0]))
             center_y = int(round(center[1]))
@@ -2114,6 +2410,22 @@ def main() -> None:
                 raise OSError(f"Could not write crop: {path}")
 
         master_rng = random.Random(args.seed)
+        quota_active = args.quota_mode and not args.golden
+        quota_schedule = (
+            build_quota_schedule(
+                args.n,
+                args.defects_per_fixture,
+                quota_classes=tuple(args.quota_classes),
+                damage_types=tuple(args.damage_types),
+            )
+            if quota_active
+            else None
+        )
+        quota_slot_rng = (
+            random.Random(args.seed + QUOTA_SLOT_SEED_OFFSET)
+            if quota_active
+            else None
+        )
         image_records = []
         labels_path = args.out / f"{args.prefix}labels.json"
         commit_hash = git_commit_hash()
@@ -2122,15 +2434,38 @@ def main() -> None:
             image_name = f"{args.prefix}img_{image_index:04d}"
             image_seed = master_rng.randrange(0, 2**63)
             scene_rng = random.Random(image_seed)
-            fixture_scenes = {
-                prefix: sample_fill_scene(
-                    scene_rng,
-                    prefix=prefix,
-                    class_balance=args.class_balance,
-                    damage_weight=args.damage_weight,
-                )
+            if args.golden:
+                fixture_scenes = {
+                    prefix: build_golden_fill_scene(prefix)
+                    for prefix in ("G", "S")
+                }
+            else:
+                fixture_scenes = {
+                    prefix: sample_fill_scene(
+                        scene_rng,
+                        prefix=prefix,
+                        class_balance=args.class_balance and not args.quota_mode,
+                        damage_weight=args.damage_weight,
+                    )
+                    for prefix in ("G", "S")
+                }
+            baseline_labels = {
+                name: label
                 for prefix in ("G", "S")
+                for name, label in fixture_scenes[prefix].labels.items()
             }
+            quota_damage_kinds = {}
+            if quota_active:
+                for prefix in ("G", "S"):
+                    fixture_scenes[prefix], fixture_damage_kinds = (
+                        apply_quota_assignments(
+                            fixture_scenes[prefix],
+                            prefix=prefix,
+                            assignments=quota_schedule[prefix][image_index],
+                            rng=quota_slot_rng,
+                        )
+                    )
+                    quota_damage_kinds.update(fixture_damage_kinds)
             labels = {
                 name: label
                 for prefix in ("G", "S")
@@ -2138,28 +2473,36 @@ def main() -> None:
             }
             if len(labels) != 60 or set(labels) != set(ALL_SLOT_NAMES):
                 raise AssertionError("Each image must contain exactly 60 G/S labels")
-            shared_offset_px = [
-                scene_rng.randint(-15, 15),
-                scene_rng.randint(-15, 15),
-            ]
-            requested_shift_px = list(shared_offset_px)
-            rotation_jitter_deg = [
-                scene_rng.uniform(-0.5, 0.5),
-                scene_rng.uniform(-0.5, 0.5),
-                scene_rng.uniform(-0.5, 0.5),
-            ]
-            (
-                jittered_rotation,
-                jittered_position,
-                translation_world,
-            ) = jitter_camera_pose(
-                rotation_world_to_cv,
-                camera_position,
-                focal,
-                reference_depth,
-                requested_shift_px,
-                rotation_jitter_deg,
-            )
+            if args.golden:
+                shared_offset_px = [0, 0]
+                requested_shift_px = [0, 0]
+                rotation_jitter_deg = [0.0, 0.0, 0.0]
+                jittered_rotation = rotation_world_to_cv.copy()
+                jittered_position = camera_position.copy()
+                translation_world = np.zeros(3, dtype=np.float64)
+            else:
+                shared_offset_px = [
+                    scene_rng.randint(-15, 15),
+                    scene_rng.randint(-15, 15),
+                ]
+                requested_shift_px = list(shared_offset_px)
+                rotation_jitter_deg = [
+                    scene_rng.uniform(-0.5, 0.5),
+                    scene_rng.uniform(-0.5, 0.5),
+                    scene_rng.uniform(-0.5, 0.5),
+                ]
+                (
+                    jittered_rotation,
+                    jittered_position,
+                    translation_world,
+                ) = jitter_camera_pose(
+                    rotation_world_to_cv,
+                    camera_position,
+                    focal,
+                    reference_depth,
+                    requested_shift_px,
+                    rotation_jitter_deg,
+                )
             camera_transform_op.Set(
                 usd_camera_matrix(jittered_rotation, jittered_position)
             )
@@ -2170,6 +2513,17 @@ def main() -> None:
             crop_centers = translated_crop_centers(
                 labeler_geometry, shared_offset_px
             )
+            damage_crop_contexts = {
+                slot_name: {
+                    "cv_rotation": jittered_rotation,
+                    "cv_position": jittered_position,
+                    "crop_center": crop_centers[slot_name],
+                    "crop_offsets": labeler_geometry["fixtures"][
+                        slot_name[0]
+                    ]["crop_offsets"],
+                }
+                for slot_name in ALL_SLOT_NAMES
+            }
             camera_jitter = {
                 "requested_shift_px": requested_shift_px,
                 "translation_world_m": translation_world.tolist(),
@@ -2177,14 +2531,97 @@ def main() -> None:
                 "position_m": jittered_position.tolist(),
                 "R_world_to_cv": jittered_rotation.tolist(),
             }
+            variation_rng = scene_rng
+            if quota_active:
+                variation_rng = clone_random_generator(scene_rng)
+                shadow_labels = dict(baseline_labels)
+                for slot_name in ALL_SLOT_NAMES:
+                    apply_slot(
+                        slot_name,
+                        shadow_labels,
+                        scene_rng,
+                        args.defect_boost,
+                        crop_context=damage_crop_contexts[slot_name],
+                    )
             variations = {}
             for slot_name in ALL_SLOT_NAMES:
                 variations[slot_name] = apply_slot(
                     slot_name,
                     labels,
-                    scene_rng,
+                    variation_rng,
                     args.defect_boost,
+                    forced_damage_kind=quota_damage_kinds.get(slot_name),
+                    crop_context=damage_crop_contexts[slot_name],
                 )
+            if quota_active:
+                for original_slot, damage_kind in list(
+                    quota_damage_kinds.items()
+                ):
+                    if labels[original_slot] == "damaged_vial":
+                        continue
+                    prefix = original_slot[0]
+                    filled_slots = list(
+                        FIXTURE_SLOT_NAMES[prefix][
+                            : fixture_scenes[prefix].expected_through
+                        ]
+                    )
+                    candidates = [
+                        slot for slot in filled_slots if labels[slot] == "pass"
+                    ]
+                    quota_slot_rng.shuffle(candidates)
+                    replacement = None
+                    for candidate in candidates:
+                        labels[candidate] = "damaged_vial"
+                        variations[candidate] = apply_slot(
+                            candidate,
+                            labels,
+                            variation_rng,
+                            args.defect_boost,
+                            forced_damage_kind=damage_kind,
+                            crop_context=damage_crop_contexts[candidate],
+                        )
+                        if labels[candidate] == "damaged_vial":
+                            replacement = candidate
+                            break
+                    if replacement is None:
+                        raise RuntimeError(
+                            f"Could not realize quota damage {damage_kind!r} "
+                            f"for fixture {prefix} in {image_name}"
+                        )
+                    del quota_damage_kinds[original_slot]
+                    quota_damage_kinds[replacement] = damage_kind
+                for prefix in ("G", "S"):
+                    expected_classes = Counter(
+                        assignment["class"]
+                        for assignment in quota_schedule[prefix][image_index]
+                    )
+                    actual_classes = Counter(
+                        labels[slot]
+                        for slot in FIXTURE_SLOT_NAMES[prefix]
+                        if labels[slot] in expected_classes
+                    )
+                    if actual_classes != expected_classes:
+                        raise RuntimeError(
+                            f"Quota class realization mismatch for {image_name} "
+                            f"fixture {prefix}: expected={dict(expected_classes)} "
+                            f"actual={dict(actual_classes)}"
+                        )
+                    expected_damage_types = Counter(
+                        assignment["damage_type"]
+                        for assignment in quota_schedule[prefix][image_index]
+                        if assignment["class"] == "damaged_vial"
+                    )
+                    actual_damage_types = Counter(
+                        variations[slot]["damage"]["kind"]
+                        for slot in FIXTURE_SLOT_NAMES[prefix]
+                        if labels[slot] == "damaged_vial"
+                    )
+                    if actual_damage_types != expected_damage_types:
+                        raise RuntimeError(
+                            f"Quota damage realization mismatch for {image_name} "
+                            f"fixture {prefix}: expected={dict(expected_damage_types)} "
+                            f"actual={dict(actual_damage_types)}"
+                        )
             for slot_name, label in labels.items():
                 if label != "damaged_vial":
                     continue
@@ -2196,7 +2633,7 @@ def main() -> None:
 
             floor_sample = sample_floor_emissive(
                 args.floor_emissive,
-                args.floor_brightness_jitter,
+                0.0 if args.golden else args.floor_brightness_jitter,
                 args.seed,
                 image_index,
             )
@@ -2226,12 +2663,18 @@ def main() -> None:
                 flush=True,
             )
 
-            lights = {
-                "key": randomize_light(key_record, (0.7, 1.8), scene_rng),
-                "fill": randomize_light(fill_record, (0.7, 2.5), scene_rng),
-            }
+            if args.golden:
+                lights = {
+                    "key": set_golden_light(key_record),
+                    "fill": set_golden_light(fill_record),
+                }
+            else:
+                lights = {
+                    "key": randomize_light(key_record, (0.7, 1.8), scene_rng),
+                    "fill": randomize_light(fill_record, (0.7, 2.5), scene_rng),
+                }
             print(
-                f"lighting {image_name}: profile={args.light_profile} "
+                f"lighting {image_name}: profile={lights['key']['profile']} "
                 f"scale={args.light_scale:.4f} "
                 f"keyIntensity={lights['key']['intensity']:.3f} "
                 f"keyTemperatureK={lights['key']['color_temperature_k']:.1f} "
@@ -2318,6 +2761,7 @@ def main() -> None:
                     },
                 }
             )
+            run_summary = build_run_summary(image_records)
             labels_document = {
                 "image_size": [width, height],
                 "generation": {
@@ -2325,12 +2769,16 @@ def main() -> None:
                     "flags": flags,
                 },
                 "lighting": {
-                    "profile": args.light_profile,
+                    "profile": "golden" if args.golden else args.light_profile,
                     "scale": args.light_scale,
                     "key_base_intensity": key_record["base_intensity"],
                     "fill_base_intensity": fill_record["base_intensity"],
-                    "key_factor_range": [0.7, 1.8],
-                    "fill_factor_range": [0.7, 2.5],
+                    "key_factor_range": (
+                        [1.0, 1.0] if args.golden else [0.7, 1.8]
+                    ),
+                    "fill_factor_range": (
+                        [1.0, 1.0] if args.golden else [0.7, 2.5]
+                    ),
                 },
                 "camera": {
                     "model": "opencv_fisheye",
@@ -2362,7 +2810,9 @@ def main() -> None:
                     "albedo": list(args.floor_albedo),
                     "emissive": list(args.floor_emissive),
                     "base_emissive": list(args.floor_emissive),
-                    "brightness_jitter_fraction": args.floor_brightness_jitter,
+                    "brightness_jitter_fraction": (
+                        0.0 if args.golden else args.floor_brightness_jitter
+                    ),
                     "station_minimum_z": station_minimum_z,
                     "frame_minimum": floor_coverage["frame_minimum"].tolist(),
                     "frame_maximum": floor_coverage["frame_maximum"].tolist(),
@@ -2413,14 +2863,18 @@ def main() -> None:
                     name: slot_info[name]["tube"]["deformation_backend"]
                     for name in ALL_SLOT_NAMES
                 },
+                "run_summary": run_summary,
                 "images": image_records,
             }
+            if args.golden:
+                labels_document["golden"] = True
             temporary_labels = labels_path.with_suffix(".json.tmp")
             temporary_labels.write_text(
                 json.dumps(labels_document, indent=2) + "\n", encoding="utf-8"
             )
             os.replace(temporary_labels, labels_path)
             print(f"done {image_name}", flush=True)
+        print_run_summary(build_run_summary(image_records))
     except BaseException:
         traceback.print_exc()
         if kit is not None:

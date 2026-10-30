@@ -6,6 +6,7 @@ data/
 datasets/
 results/
 out/
+weights/
 gen_test/
 real_examples/
 twin/usd/
@@ -46,4 +47,5 @@ digital_twin/
 id_ed25519*
 *.pem
 *.tar.gz
+*.tar
 .vscode-server/

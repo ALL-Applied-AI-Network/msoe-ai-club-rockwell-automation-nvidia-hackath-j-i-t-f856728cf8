@@ -8,6 +8,7 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,7 +19,10 @@ if str(SCRIPTS) not in sys.path:
 
 from gen_tray_v2 import (
     DEFAULT_FLOOR_EMISSIVE,
+    QUOTA_SLOT_SEED_OFFSET,
     approximate_uncovered_crop_corners,
+    build_run_summary,
+    clone_random_generator,
     compute_labeler_plane_coverage,
     default_light_scale,
     floor_box_spec,
@@ -27,15 +31,163 @@ from gen_tray_v2 import (
     labeler_grid_center,
     local_matrix_for_world_box,
     panel_crop_overruns,
+    parse_args,
+    parse_damage_types,
     parse_nonnegative_rgb_triplet,
+    parse_quota_classes,
     project_slab_corners_to_fisheye,
+    projected_points_crop_check,
     sample_floor_emissive,
     sample_light_settings,
     translated_crop_centers,
 )
+from fill_logic import apply_quota_assignments, build_quota_schedule, sample_fill_scene
 
 
 class GeneratorGeometryTests(unittest.TestCase):
+    def test_quota_and_damage_type_flag_parsers(self) -> None:
+        self.assertEqual(
+            parse_quota_classes("damaged_vial,missing_cap"),
+            ("damaged_vial", "missing_cap"),
+        )
+        self.assertEqual(
+            parse_damage_types("lean_crush,bend"),
+            ("lean_crush", "bend"),
+        )
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_quota_classes("pass")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_damage_types("lean_crush,lean_crush")
+
+    def test_projected_lean_points_must_both_be_inside_crop(self) -> None:
+        crop_center = (100.0, 100.0)
+        s_offsets = (-28, -34, 143, 96)
+        inside = projected_points_crop_check(
+            (125.0, 100.0),
+            (220.0, 150.0),
+            crop_center,
+            s_offsets,
+        )
+        self.assertTrue(inside["center_inside"])
+        self.assertTrue(inside["tip_inside"])
+        self.assertTrue(inside["inside"])
+
+        outside = projected_points_crop_check(
+            (125.0, 100.0),
+            (244.0, 150.0),
+            crop_center,
+            s_offsets,
+        )
+        self.assertTrue(outside["center_inside"])
+        self.assertFalse(outside["tip_inside"])
+        self.assertFalse(outside["inside"])
+
+    def test_golden_cli_flag_defaults_off_and_can_be_enabled(self) -> None:
+        with patch.object(sys, "argv", ["gen_tray_v2.py"]):
+            defaults = parse_args()
+            self.assertFalse(defaults.golden)
+            self.assertEqual(
+                defaults.quota_classes,
+                ("missing_cap", "crooked_cap", "damaged_vial"),
+            )
+            self.assertEqual(
+                defaults.damage_types,
+                ("bend", "crush", "lean_crush", "broken_top"),
+            )
+        with patch.object(sys, "argv", ["gen_tray_v2.py", "--golden"]):
+            self.assertTrue(parse_args().golden)
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "gen_tray_v2.py",
+                "--quota-classes",
+                "damaged_vial",
+                "--damage-types",
+                "lean_crush",
+            ],
+        ):
+            filtered = parse_args()
+            self.assertEqual(filtered.quota_classes, ("damaged_vial",))
+            self.assertEqual(filtered.damage_types, ("lean_crush",))
+
+    def test_run_summary_counts_labels_and_damage_types(self) -> None:
+        summary = build_run_summary(
+            [
+                {
+                    "labels": {
+                        "G01": "damaged_vial",
+                        "G02": "pass",
+                        "S01": "missing_cap",
+                        "S02": "no_vial",
+                    },
+                    "variations": {
+                        "G01": {"damage": {"kind": "bend"}},
+                        "G02": {},
+                        "S01": {},
+                        "S02": {},
+                    },
+                }
+            ]
+        )
+        self.assertEqual(summary["G"]["damaged_vial"], 1)
+        self.assertEqual(summary["G"]["pass"], 1)
+        self.assertEqual(summary["G"]["damage_types"]["bend"], 1)
+        self.assertEqual(summary["S"]["missing_cap"], 1)
+        self.assertEqual(summary["S"]["no_vial"], 1)
+
+    def test_quota_mode_preserves_lighting_and_floor_samples(self) -> None:
+        seed = 311
+        image_seed = 987654321
+        off_rng = random.Random(image_seed)
+        quota_rng = random.Random(image_seed)
+        off_scenes = {
+            prefix: sample_fill_scene(off_rng, prefix=prefix)
+            for prefix in ("G", "S")
+        }
+        quota_scenes = {
+            prefix: sample_fill_scene(quota_rng, prefix=prefix)
+            for prefix in ("G", "S")
+        }
+        self.assertEqual(off_scenes, quota_scenes)
+
+        for rng in (off_rng, quota_rng):
+            rng.randint(-15, 15)
+            rng.randint(-15, 15)
+            for _ in range(3):
+                rng.uniform(-0.5, 0.5)
+
+        slot_rng = random.Random(seed + QUOTA_SLOT_SEED_OFFSET)
+        schedule = build_quota_schedule(1, 3)
+        for prefix in ("G", "S"):
+            apply_quota_assignments(
+                quota_scenes[prefix],
+                prefix=prefix,
+                assignments=schedule[prefix][0],
+                rng=slot_rng,
+            )
+
+        quota_variation_rng = clone_random_generator(quota_rng)
+        for _ in range(40):
+            quota_variation_rng.random()
+        for _ in range(40):
+            off_rng.random()
+            quota_rng.random()
+
+        off_lights = [
+            sample_light_settings(off_rng, limits, "real", 1.35)
+            for limits in ((0.7, 1.8), (0.7, 2.5))
+        ]
+        quota_lights = [
+            sample_light_settings(quota_rng, limits, "real", 1.35)
+            for limits in ((0.7, 1.8), (0.7, 2.5))
+        ]
+        self.assertEqual(off_lights, quota_lights)
+        self.assertEqual(
+            sample_floor_emissive(DEFAULT_FLOOR_EMISSIVE, 0.25, seed, 0),
+            sample_floor_emissive(DEFAULT_FLOOR_EMISSIVE, 0.25, seed, 0),
+        )
+
     def test_floor_emissive_is_omitted_when_zero_and_authored_when_nonzero(self) -> None:
         zero_inputs = floor_material_inputs(
             (0.36, 0.31, 0.22), (0.0, 0.0, 0.0)

@@ -52,7 +52,12 @@ def resolve_labels(results: Path, explicit: Path | None) -> Path:
     return candidates[0]
 
 
-def make_tile(crop_path: Path, damage_type: str, strength: float) -> np.ndarray:
+def make_tile(
+    crop_path: Path,
+    damage_type: str,
+    strength: float,
+    center_inside: bool | None,
+) -> np.ndarray:
     crop = cv2.imread(str(crop_path), cv2.IMREAD_COLOR)
     if crop is None:
         raise FileNotFoundError(f"Could not read crop: {crop_path}")
@@ -69,10 +74,13 @@ def make_tile(crop_path: Path, damage_type: str, strength: float) -> np.ndarray:
     tile[: enlarged.shape[0]] = enlarged
     cv2.putText(
         tile,
-        f"{damage_type} {strength:.4g}",
+        (
+            f"{damage_type} {strength:.4g} center_in="
+            f"{'yes' if center_inside else 'no' if center_inside is False else '?'}"
+        ),
         (4, enlarged.shape[0] + 22),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
+        0.32,
         (0, 0, 0),
         1,
         cv2.LINE_AA,
@@ -85,7 +93,7 @@ def main() -> None:
     ensure_external_output(args.out)
     labels_path = resolve_labels(args.results, args.labels)
     document = json.loads(labels_path.read_text(encoding="utf-8"))
-    grouped: dict[str, list[tuple[Path, float]]] = {
+    grouped: dict[str, list[tuple[Path, float, bool | None]]] = {
         damage_type: [] for damage_type in DAMAGE_TYPES
     }
     for record in document["images"]:
@@ -101,6 +109,7 @@ def main() -> None:
                 (
                     args.results / "crops" / f"{image_stem}_{slot}.png",
                     float(damage["strength"]),
+                    damage.get("crop_check", {}).get("center_inside"),
                 )
             )
 
@@ -112,9 +121,18 @@ def main() -> None:
             rng.sample(samples, 12) if len(samples) > 12 else list(samples)
         )
         tiles = [
-            make_tile(crop_path, damage_type, strength)
-            for crop_path, strength in selected
+            make_tile(crop_path, damage_type, strength, center_inside)
+            for crop_path, strength, center_inside in selected
         ]
+        for crop_path, _, center_inside in selected:
+            status = (
+                "yes"
+                if center_inside
+                else "no"
+                if center_inside is False
+                else "unknown"
+            )
+            print(f"tile {crop_path.name}: center_inside={status}")
         if tiles:
             tile_height = max(tile.shape[0] for tile in tiles)
             tile_width = max(tile.shape[1] for tile in tiles)

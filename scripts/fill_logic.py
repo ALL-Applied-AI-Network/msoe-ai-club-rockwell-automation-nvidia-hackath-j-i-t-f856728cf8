@@ -13,6 +13,8 @@ ALL_SLOT_NAMES = G_SLOT_NAMES + S_SLOT_NAMES
 SLOT_NAMES = G_SLOT_NAMES
 OCCUPIED_CLASSES = ("pass", "missing_cap", "crooked_cap", "damaged_vial")
 OCCUPIED_WEIGHTS = (0.80, 0.07, 0.07, 0.06)
+QUOTA_DEFECT_CLASSES = ("missing_cap", "crooked_cap", "damaged_vial")
+QUOTA_DAMAGE_TYPES = ("bend", "crush", "lean_crush", "broken_top")
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,113 @@ class FillScene:
     not_yet_filled: list[str]
     expected_through: int
     missed_position: str | None
+
+
+def build_golden_fill_scene(prefix: str) -> FillScene:
+    """Return a completely filled, all-pass fixture for reference renders."""
+    if prefix not in ("G", "S"):
+        raise ValueError("prefix must be 'G' or 'S'")
+    slot_names = G_SLOT_NAMES if prefix == "G" else S_SLOT_NAMES
+    return FillScene(
+        labels={slot: "pass" for slot in slot_names},
+        not_yet_filled=[],
+        expected_through=30,
+        missed_position=None,
+    )
+
+
+def build_quota_schedule(
+    image_count: int,
+    defects_per_fixture: int,
+    *,
+    quota_classes: tuple[str, ...] = QUOTA_DEFECT_CLASSES,
+    damage_types: tuple[str, ...] = QUOTA_DAMAGE_TYPES,
+) -> dict[str, list[list[dict[str, str | None]]]]:
+    """Build balanced per-fixture defect and damage schedules for a run."""
+    if image_count < 1:
+        raise ValueError("image_count must be at least 1")
+    if not 0 <= defects_per_fixture <= 30:
+        raise ValueError("defects_per_fixture must be from 0 to 30")
+    if not quota_classes or any(
+        label not in QUOTA_DEFECT_CLASSES for label in quota_classes
+    ):
+        raise ValueError("quota_classes must contain supported defect classes")
+    if len(set(quota_classes)) != len(quota_classes):
+        raise ValueError("quota_classes must not contain duplicates")
+    if not damage_types or any(
+        damage_type not in QUOTA_DAMAGE_TYPES for damage_type in damage_types
+    ):
+        raise ValueError("damage_types must contain supported damage types")
+    if len(set(damage_types)) != len(damage_types):
+        raise ValueError("damage_types must not contain duplicates")
+
+    schedules: dict[str, list[list[dict[str, str | None]]]] = {}
+    for prefix in ("G", "S"):
+        class_index = 0
+        damage_index = 0
+        fixture_schedule = []
+        for _ in range(image_count):
+            image_assignments = []
+            for _ in range(defects_per_fixture):
+                label = quota_classes[class_index % len(quota_classes)]
+                class_index += 1
+                damage_type = None
+                if label == "damaged_vial":
+                    damage_type = damage_types[damage_index % len(damage_types)]
+                    damage_index += 1
+                image_assignments.append(
+                    {"class": label, "damage_type": damage_type}
+                )
+            fixture_schedule.append(image_assignments)
+        schedules[prefix] = fixture_schedule
+    return schedules
+
+
+def apply_quota_assignments(
+    scene: FillScene,
+    *,
+    prefix: str,
+    assignments: list[dict[str, str | None]],
+    rng: random.Random,
+) -> tuple[FillScene, dict[str, str]]:
+    """Apply exact scheduled defects to distinct slots in a filled prefix."""
+    if prefix not in ("G", "S"):
+        raise ValueError("prefix must be 'G' or 'S'")
+    if len(assignments) > 30:
+        raise ValueError("at most 30 defects may be assigned per fixture")
+    slot_names = G_SLOT_NAMES if prefix == "G" else S_SLOT_NAMES
+    filled_count = max(scene.expected_through, len(assignments))
+    filled_slots = list(slot_names[:filled_count])
+    selected_slots = rng.sample(filled_slots, len(assignments))
+    labels = {
+        slot: "pass" if index < filled_count else "no_vial"
+        for index, slot in enumerate(slot_names)
+    }
+    damage_types = {}
+    for slot, assignment in zip(selected_slots, assignments, strict=True):
+        label = assignment["class"]
+        if label not in QUOTA_DEFECT_CLASSES:
+            raise ValueError(f"Unsupported quota class: {label!r}")
+        labels[slot] = label
+        damage_type = assignment.get("damage_type")
+        if label == "damaged_vial":
+            if damage_type not in QUOTA_DAMAGE_TYPES:
+                raise ValueError(
+                    f"Unsupported quota damage type: {damage_type!r}"
+                )
+            damage_types[slot] = str(damage_type)
+        elif damage_type is not None:
+            raise ValueError("Only damaged_vial assignments may have a damage type")
+
+    return (
+        FillScene(
+            labels=labels,
+            not_yet_filled=list(slot_names[filled_count:]),
+            expected_through=filled_count,
+            missed_position=None,
+        ),
+        damage_types,
+    )
 
 
 def fill_count_weights() -> tuple[float, ...]:
