@@ -4,7 +4,8 @@ Frames arrive as <frames>/<cam>/<tray>_sSS.png for cam in top / side / diag (the
 state 00 is the empty tray, state k has vials 1..k (vial k went into slot k, fill order G01..G30).
 
 python live.py dataset_v1_partial/dataset_v1_partial/frames train_0031 --pace 1   # replay a recorded tray, 1 s a step
-python live.py live_frames                    # replay / follow the frames capture.py saved: newest tray, then new ones
+python live.py <frames>                       # follow a frame writer (e.g. Isaac Sim): newest tray, then new ones
+(USB cameras: capture.py runs the same check in memory, no frames folder.)
 Esc closes the window. With no display (the Spark over ssh) there is no window: each tray's dashboard is saved as
 live_videos/<tray>.mp4 instead (--videos), one frame per step.
 """

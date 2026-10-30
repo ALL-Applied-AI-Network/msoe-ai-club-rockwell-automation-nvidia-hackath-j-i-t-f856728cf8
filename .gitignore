@@ -52,7 +52,6 @@ id_ed25519*
 dataset*/
 data_sim/
 frames/
-live_frames/
 live_videos/
 models/
 ref_side_empty.png

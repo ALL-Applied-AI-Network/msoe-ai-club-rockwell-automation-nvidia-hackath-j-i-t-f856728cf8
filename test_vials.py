@@ -1,12 +1,12 @@
 """python test_vials.py -- checks the slot grid maths, the side skyline and 45-deg upright checks, the verdicts,
-and the capture trigger / file hand-off to live.py."""
+the capture trigger, and live.py finding trays in a frames folder."""
 import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from capture import PlacementTrigger, next_tray, save
+from capture import PlacementTrigger
 from infer import decide
 from live import follow
 from skyline import measure
@@ -82,14 +82,12 @@ def test_trigger():
     assert [t.update(f, now) for f, now in frames] == [False, False, False, True, False]  # arm came and went: one placement
 
 
-def test_capture_files():
+def test_follow():
     with tempfile.TemporaryDirectory() as d:
-        assert next_tray(d, "tray") == "tray_0001"
-        img = np.zeros((4, 4, 3), np.uint8)
-        save({"top": img, "side": img, "diag": img}, d, "tray_0001", 0)
-        assert sorted(p.name for p in Path(d).rglob("*.png")) == ["tray_0001_s00.png"] * 3  # no temp files left
-        assert next_tray(d, "tray") == "tray_0002"
-        assert next(follow(Path(d))) == "tray_0001"
+        (Path(d) / "top").mkdir()
+        for tray in ("tray_0001", "tray_0002"):
+            cv2.imwrite(str(Path(d) / "top" / f"{tray}_s00.png"), np.zeros((4, 4, 3), np.uint8))
+        assert next(follow(Path(d))) == "tray_0002"  # starts at the newest tray already begun
 
 
 if __name__ == "__main__":
@@ -98,5 +96,5 @@ if __name__ == "__main__":
     test_upright()
     test_decide()
     test_trigger()
-    test_capture_files()
+    test_follow()
     print("ok")

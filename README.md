@@ -67,7 +67,7 @@ Show one episode step by step:
 python infer.py dataset_v1_partial/dataset_v1_partial --episodes train_0031 -v
 ```
 
-Run the self-check (synthetic tests of the geometry, the decision rules and the capture hand-off):
+Run the self-check (synthetic tests of the geometry, the decision rules and the capture trigger):
 
 ```bash
 python test_vials.py
@@ -89,24 +89,20 @@ The dashboard has four panels:
 
 Esc closes it.
 
-**Run with USB cameras.** You need two terminals.
+**Run with USB cameras** (Windows):
 
 1. Find which camera index is which (saves `cam_<i>.png`; index 0 is often the laptop webcam):
    ```bash
    python capture.py --list
    ```
-2. Capture. `--settings` opens each driver's dialog, where you should turn off auto exposure, auto white balance and autofocus:
+2. Capture and check. `--settings` opens each driver's dialog, where you should turn off auto exposure, auto white balance and autofocus:
    ```bash
    python capture.py --top 0 --side 1 --diag 2 --settings
    ```
-3. In the second terminal, check each tray as it fills:
-   ```bash
-   python live.py live_frames
-   ```
 
-`capture.py` saves one frame per camera after every placement. It counts a placement when something moves over the tray in the top view and the tray then stays still for `--settle` seconds (default 1). The first still moment is saved as the empty tray. Keys: Space captures now, N starts a new tray, Esc quits.
+`capture.py` grabs one frame per camera after every placement and checks that slot on the spot, with the same dashboard as the replay. Frames stay in memory; nothing is saved. It counts a placement when something moves over the tray in the top view and the tray then stays still for `--settle` seconds (default 1). The first still moment is taken as the empty tray. Keys: Space captures now, N starts a new tray, Esc quits.
 
-Expected sizes are top 640×480 and side / 45° 1920×1080. `live.py` follows any folder laid out like this, so another frame source (Isaac Sim, a robot "placed" signal) only has to write the same files:
+Expected sizes are top 640×480 and side / 45° 1920×1080. `live.py` also follows a frames folder as it fills, so another frame source (Isaac Sim, a robot "placed" signal) only has to write these files:
 
 ```
 <frames>/{top,side,diag}/<tray>_s00.png   empty tray (first: it sets that tray's skyline)
@@ -148,7 +144,7 @@ AFTER  (state k)   ─┼─► top  : crop slot k ──► 3 × ResNet-18 ─�
 | `upright.py` | 45° cap-outline measurement and tilt score |
 | `infer.py` | `check_step()` combines all three; the CLI scores recorded episodes |
 | `live.py` | Follows a frames folder and shows the live dashboard |
-| `capture.py` | USB camera capture with the placement trigger |
+| `capture.py` | USB cameras: placement trigger plus the live check, in memory |
 | `test_vials.py` | Self-check |
 | `slots.py`, `trays.json` | Older grid-based crop tool for real photos (not used by the pipeline above) |
 

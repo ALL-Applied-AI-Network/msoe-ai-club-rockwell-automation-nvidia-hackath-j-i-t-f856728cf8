@@ -1,8 +1,7 @@
 """live.py for USB cameras: grab one frame from each camera after every placement and check it on the spot,
-with the same dashboard and per-step lines. The frames are also saved, so live.py can replay a tray later:
-    <out>/{top,side,diag}/<tray>_sSS.png      s00 = empty tray, sNN = after vial NN went in
+with the same dashboard and per-step lines. Frames stay in memory (only the previous state is kept); nothing is saved.
 
-python capture.py --list                                  # which index is which camera (saves cam_<i>.png)
+python capture.py --list                                 # which index is which camera (saves cam_<i>.png)
 python capture.py --top 0 --side 1 --diag 2 --settings    # lock exposure / focus / white balance, then check
 
 A placement = something moves over the tray in the top view (the arm), then the tray stays still for --settle s.
@@ -11,7 +10,6 @@ Space captures now, N starts a new tray (its next capture is the empty tray), Es
 """
 import argparse
 import json
-import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -83,21 +81,6 @@ def read_all(caps):
     return frames
 
 
-def save(frames, out, tray, s):
-    for cam, img in frames.items():
-        d = Path(out) / cam
-        d.mkdir(parents=True, exist_ok=True)
-        tmp = d / f".{tray}_s{s:02d}.tmp.png"
-        cv2.imwrite(str(tmp), img)
-        os.replace(tmp, d / f"{tray}_s{s:02d}.png")  # live.py never sees a half-written file
-
-
-def next_tray(out, prefix):
-    """Next unused tray id, so a restart carries on numbering instead of overwriting."""
-    nums = [int(p.name[len(prefix) + 1:len(prefix) + 5]) for p in (Path(out) / "top").glob(f"{prefix}_*_s00.png")]
-    return f"{prefix}_{max(nums, default=0) + 1:04d}"
-
-
 def preview(frames, roi, tray, s, moving):
     top = frames["top"].copy()
     cv2.rectangle(top, roi[:2], roi[2:], (0, 255, 255) if moving else (0, 200, 0), 2)
@@ -125,8 +108,6 @@ def main():
     ap.add_argument("--top", type=int)
     ap.add_argument("--side", type=int)
     ap.add_argument("--diag", type=int)
-    ap.add_argument("--out", default="live_frames")
-    ap.add_argument("--prefix", default="tray")
     ap.add_argument("--settle", type=float, default=1.0, help="seconds of stillness that end a placement")
     ap.add_argument("--motion-px", type=int, default=40, help="changed pixels in the tray area that count as motion")
     ap.add_argument("--settings", action="store_true", help="open each camera's driver dialog to lock exposure etc.")
@@ -148,13 +129,9 @@ def main():
     boxes = np.array(list(table["top"].values()))
     roi = (int(boxes[:, 0].min()) - 10, int(boxes[:, 1].min()) - 10, int(boxes[:, 2].max()) + 10, int(boxes[:, 3].max()) + 10)
     trigger = PlacementTrigger(roi, args.settle, args.motion_px)
-    tray, s, verdicts = next_tray(args.out, args.prefix), 0, {}
+    n, s, verdicts = 1, 0, {}  # tray number, next state (0 = empty tray), this tray's verdicts
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    print(f"capturing {tray} into {args.out}/ ... Space = capture now, N = new tray, Esc = quit")
-
-    def done():  # the tray's tally, as live.py prints it
-        if verdicts:
-            print(f"{tray} done:", dict(Counter(verdicts.values())))
+    print("checking tray_0001 ... Space = capture now, N = new tray, Esc = quit")
 
     while True:
         frames = read_all(caps)
@@ -162,23 +139,20 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key == 27:
             break
-        if key in (ord("n"), ord("N")):
-            done()
-            tray, s, verdicts = next_tray(args.out, args.prefix), 0, {}
-            print(f"new tray {tray}: next capture is its empty tray")
-        elif fire or key == ord(" "):
-            save(frames, args.out, tray, s)
+        if fire or key == ord(" "):
             if s == 0:  # the empty tray: what step 1 is compared against, and where this tray's skyline sits
-                print(f"--- {tray}  ({time.strftime('%H:%M:%S')}, empty tray saved)")
+                print(f"--- tray_{n:04d}  ({time.strftime('%H:%M:%S')}, empty tray)")
                 sky = episode_skyline(frames["side"], ref_empty, table["side_ref_skyline"])
             else:
                 cv2.imshow(WIN, check(s, before, frames, sky, verdicts, models, table, dev))
-            before = frames
+            before = frames  # the only frames kept: the next step is compared against them
             s += 1
-            if s > 30:  # tray full: the next capture is the next tray's empty state
-                done()
-                tray, s, verdicts = next_tray(args.out, args.prefix), 0, {}
-        cv2.imshow("capture", preview(frames, roi, tray, s, trigger.moving))
+        if s > 0 and (key in (ord("n"), ord("N")) or s > 30):  # N, or tray full: next capture is a new empty tray
+            if verdicts:
+                print(f"tray_{n:04d} done:", dict(Counter(verdicts.values())))
+            n, s, verdicts = n + 1, 0, {}
+            print(f"new tray tray_{n:04d}: next capture is its empty tray")
+        cv2.imshow("capture", preview(frames, roi, f"tray_{n:04d}", s, trigger.moving))
     for cap in caps.values():
         cap.release()
     cv2.destroyAllWindows()

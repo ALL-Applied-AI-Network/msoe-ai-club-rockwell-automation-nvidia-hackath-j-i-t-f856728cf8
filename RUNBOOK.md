@@ -83,7 +83,7 @@ This tests:
 - the side skyline check and the 45° check;
 - every `decide()` rule;
 - the placement trigger;
-- the hand-off of files from capture to live.
+- how `live.py` finds trays in a frames folder.
 
 It doesn't load the models or the dataset; step 4 does.
 
@@ -163,22 +163,22 @@ scp yt-jit3783@172.30.102.95:/home/yt-jit3783/workspace/hackathon/live_videos/tr
    ```bash
    python capture.py --list
    ```
-2. **Capture and check** with your indices (venv active). `--settings` opens each camera's driver dialog, where you turn off auto exposure, auto white balance and autofocus. Start with the empty tray in view, because the first still moment is saved as the empty tray.
+2. **Capture and check** with your indices (venv active). `--settings` opens each camera's driver dialog, where you turn off auto exposure, auto white balance and autofocus. Start with the empty tray in view, because the first still moment is taken as the empty tray.
    ```bash
    python capture.py --top 0 --side 1 --diag 2 --settings
    ```
-   It prints `capturing tray_0001 into live_frames/ ...`, then `--- tray_0001  (<time>, empty tray saved)`. After each placement it checks that slot on the spot, the same way as step 5: one `GNN <verdict> ...` line, and the `vial check` window shows the dashboard. After `G30` it prints `tray_0001 done: {...}`. A second window, `capture`, shows the three cameras live, with the tray box yellow while something moves.
+   It prints `checking tray_0001 ...`, then `--- tray_0001  (<time>, empty tray)`. After each placement it checks that slot on the spot, the same way as step 5: one `GNN <verdict> ...` line, and the `vial check` window shows the dashboard. After `G30` it prints `tray_0001 done: {...}` and `new tray tray_0002 ...`. A second window, `capture`, shows the three cameras live, with the tray box yellow while something moves.
 
-   Every captured frame is also saved to `live_frames/`. To replay a tray afterwards, run `python live.py live_frames tray_0001 --pace 1`.
+   Nothing is written to disk. Only the previous state's frames are kept, for comparison with the next one, so a tray can't be replayed afterwards.
 
 - **Frame sizes.** The top camera must give 640×480, and the side and 45° cameras 1920×1080. `warning: <cam> gives WxH, resizing ...` means the slot boxes may be off.
 - **Keys in the capture window.**
   - Space captures now.
   - N starts a new tray; its next capture is the empty tray.
   - Esc quits.
-  - After `s30`, the next capture starts a new tray by itself.
+  - After `G30`, the next capture starts a new tray by itself.
 - **What counts as a placement.** Motion over the tray in the top view, then `--settle` seconds of stillness (default 1.0). Motion means more than `--motion-px` changed pixels (default 40).
-- **Restarting.** Tray ids carry on from the highest one in `live_frames/`, so a restart never overwrites a tray.
+- **Restarting.** Tray numbers start again at `tray_0001`.
 
 ---
 
@@ -275,7 +275,6 @@ These are the constants at the top of `infer.py`, picked on the 26 training tray
 | `ref_side_empty.png` | no | `prep.py` (copy of `train_0000`'s side `s00`) | `infer.py`, `live.py`, `capture.py` |
 | `data_sim/{train,val}/<class>/` | no | `prep.py` | `train.py` |
 | `models/{cap,vial,empty}.pt` | no | `train.py` | `infer.py`, `live.py`, `capture.py` |
-| `live_frames/{top,side,diag}/` | no | `capture.py` | `live.py`, to replay a captured tray |
 | `live_videos/<tray>.mp4` | no | `live.py` on a machine with no display | you, to watch the dashboard |
 | `cam_<i>.png` | no | `capture.py --list` | you, to identify the cameras |
 
@@ -291,7 +290,7 @@ Any frame source can feed `live.py`, including Isaac Sim or a robot's "placed" s
 <frames>/{top,side,diag}/<tray>_sNN.png    after vial NN went in, NN = 01..30
 ```
 
-Write each file atomically: write a temp file, then rename it, as `capture.save` does. `live.py` waits `--timeout` seconds (default 60) for each state.
+Write each file atomically: write a temp file, then rename it (`os.replace`), so `live.py` never reads a half-written PNG. `live.py` waits `--timeout` seconds (default 60) for each state.
 
 ---
 
@@ -312,9 +311,9 @@ Write each file atomically: write a temp file, then rename it, as `capture.save`
 | `qt.qpa.xcb: could not connect to display` then `Aborted (core dumped)` from `live.py` | `DISPLAY` is set, but no X server answers (for example `ssh -X` without an X server on the laptop) | `unset DISPLAY` and rerun; `live.py` then saves a video (step 5) |
 | `camera N didn't open` | Wrong index, or not on Windows | `python capture.py --list` on Windows |
 | `live.py` prints nothing, then `no empty-tray frames <tray>_s00.png under ...` after 60 s | That tray's `s00` is missing from one of `top/`, `side/`, `diag/` | Make sure all three files exist; `--timeout` waits longer |
-| `python live.py live_frames` shows nothing | No `*_s00.png` in `live_frames/top/` yet; it waits without printing | Start `capture.py` first |
-| `no state N within 60 s, stopping this tray` | Replaying a tray whose capture stopped before `s30` | Expected for an unfinished tray |
-| `capture.py` verdicts look shifted by one slot | It missed a placement, so its step count is one behind the vials on the tray | Press Space before the next placement to save the missed state; see the next row |
+| `python live.py <frames>` (no tray) shows nothing | No `*_s00.png` in `<frames>/top/` yet; it waits without printing | Start the frame writer first |
+| `no state N within 60 s, stopping this tray` | The frame writer stopped before `s30`, or one camera's file is missing | Expected for an unfinished tray; otherwise check all three folders |
+| `capture.py` verdicts look shifted by one slot | It missed a placement, so its step count is one behind the vials on the tray | Press Space before the next placement to capture the missed state; see the next row |
 | Placements missed or doubled | The arm paused over the tray longer than `--settle`, or the scene is noisy | Tune `--settle` and `--motion-px`, or capture with Space |
 | Slot boxes off target on real cameras | The geometry is fit to the digital twin | Real cameras need their own calibration (see Limits) |
 
